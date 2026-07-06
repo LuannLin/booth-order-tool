@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>摊位点单</title>
+  <link rel="stylesheet" href="/public/styles.css">
+</head>
+<body class="shop-body">
+  <header class="shop-hero">
+    <img id="boothLogo" class="booth-logo" alt="" hidden>
+    <div>
+      <h1 id="boothName">摊位点单</h1>
+      <p id="welcome">欢迎光临</p>
+    </div>
+  </header>
+
+  <main class="shop-layout">
+    <section class="catalog-panel">
+      <div class="toolbar">
+        <input id="searchInput" type="search" placeholder="搜索商品、作者、标签">
+        <select id="categoryFilter"><option value="">全部分类</option></select>
+      </div>
+      <div id="productGrid" class="product-grid"></div>
+    </section>
+
+    <aside class="cart-panel">
+      <h2>购物车</h2>
+      <div id="cartItems" class="cart-items empty">还没有选择商品</div>
+      <div class="cart-total">
+        <span>合计</span>
+        <strong id="cartTotal">¥0.00</strong>
+      </div>
+      <form id="checkoutForm" class="checkout-form">
+        <label>领取方式</label>
+        <div class="segmented">
+          <button type="button" class="active" data-receive="now">现在领取</button>
+          <button type="button" data-receive="later">稍后领取</button>
+        </div>
+        <label id="phoneLabel" hidden>联系电话
+          <input id="phoneInput" type="tel" inputmode="numeric" maxlength="11" pattern="[0-9]{11}" placeholder="请填写 11 位手机号">
+        </label>
+        <label id="tailLabel">手机号后四位
+          <input id="phoneTailInput" type="tel" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" placeholder="用于取货核对">
+        </label>
+        <label id="pickupTimeLabel" hidden>预计领取时间
+          <select id="pickupTimeInput"></select>
+          <button id="clearPickupTime" class="ghost-btn" type="button">取消时间选择</button>
+        </label>
+        <label>支付方式</label>
+        <div class="segmented">
+          <button type="button" class="active" data-pay="wechat">微信</button>
+          <button type="button" data-pay="alipay">支付宝</button>
+          <button type="button" data-pay="cash">现金</button>
+        </div>
+        <label>备注
+          <input id="noteInput" type="text" placeholder="有特殊情况可以写这里">
+        </label>
+        <button id="submitOrder" class="primary-btn" type="submit">结算并生成取单码</button>
+      </form>
+    </aside>
+  </main>
+
+  <dialog id="orderDialog" class="order-dialog">
+    <div id="orderResult"></div>
+    <button id="closeDialog" class="primary-btn" type="button">我记住了</button>
+  </dialog>
+
+  <script src="/public/shop.js"></script>
+</body>
+</html>
