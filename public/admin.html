@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>摊主后台</title>
+  <link rel="stylesheet" href="/public/styles.css">
+</head>
+<body class="admin-body">
+  <section id="loginView" class="login-view">
+    <form id="loginForm" class="login-card">
+      <h1>摊主后台</h1>
+      <input id="passwordInput" type="password" placeholder="后台密码" autocomplete="current-password">
+      <button class="primary-btn" type="submit">进入后台</button>
+      <p class="hint">默认密码是 123456，进入后可以改。</p>
+      <p class="hint">忘记密码时，可在工具文件夹双击“重置后台密码.bat”。</p>
+    </form>
+  </section>
+
+  <section id="adminMount"></section>
+
+  <script src="/public/admin.js"></script>
+</body>
+</html>
