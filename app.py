@@ -20,6 +20,9 @@ DATA_DIR = Path(os.environ.get("BOOTH_DATA_DIR", BASE_DIR / "data"))
 DB_PATH = DATA_DIR / "booth.sqlite3"
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8765"))
+ADMIN_PATH = os.environ.get("ADMIN_PATH", "/admin")
+if not ADMIN_PATH.startswith("/"):
+    ADMIN_PATH = "/" + ADMIN_PATH
 
 JSON_HEADERS = {"Content-Type": "application/json; charset=utf-8"}
 ADMIN_COOKIE = "booth_admin"
@@ -301,7 +304,7 @@ class BoothHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path == "/":
             return self.serve_file("index.html")
-        if path == "/admin":
+        if path == ADMIN_PATH:
             return self.serve_file("admin.html")
         if path.startswith("/public/"):
             return self.serve_file(path.removeprefix("/public/"))
@@ -716,8 +719,8 @@ def main() -> None:
     init_db()
     server = ThreadingHTTPServer((HOST, PORT), BoothHandler)
     print(f"漫展摆摊工具已启动： http://127.0.0.1:{PORT}")
-    print(f"后台入口： http://127.0.0.1:{PORT}/admin")
-    print("默认后台密码：123456，第一次使用请在后台设置里改掉。")
+    print(f"后台入口： http://127.0.0.1:{PORT}{ADMIN_PATH}")
+    print("第一次使用请进入后台修改默认密码。")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
