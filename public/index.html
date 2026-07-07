@@ -25,7 +25,10 @@
     </section>
 
     <aside class="cart-panel">
-      <h2>购物车</h2>
+      <div class="cart-heading">
+        <h2>购物车</h2>
+        <span id="cartCount" class="cart-count" hidden>0</span>
+      </div>
       <div id="cartItems" class="cart-items empty">还没有选择商品</div>
       <div class="cart-total">
         <span>合计</span>
@@ -65,6 +68,8 @@
     <div id="orderResult"></div>
     <button id="closeDialog" class="primary-btn" type="button">我记住了</button>
   </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
   <script src="/public/shop.js"></script>
 </body>
