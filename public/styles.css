@@ -1,13 +1,16 @@
 :root {
   color-scheme: light;
-  --ink: #202124;
-  --muted: #667085;
-  --line: #dde3ea;
+  --ink: #232629;
+  --muted: #66717c;
+  --line: #d9e1e7;
   --paper: #ffffff;
-  --wash: #f6f8fb;
-  --brand: #0f8b8d;
-  --brand-strong: #0b6f70;
-  --accent: #d95f59;
+  --wash: #f4f7f7;
+  --brand: #10847e;
+  --brand-strong: #0a645f;
+  --accent: #e2584f;
+  --accent-soft: #fff0ed;
+  --fresh: #ecf8f5;
+  --shadow: 0 12px 32px rgba(30, 45, 55, .08);
   --paid: #1f8a5b;
   --warn: #b65c00;
   font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
@@ -24,7 +27,9 @@
 body {
   margin: 0;
   color: var(--ink);
-  background: var(--wash);
+  background:
+    linear-gradient(180deg, #eaf6f5 0, rgba(234, 246, 245, 0) 260px),
+    var(--wash);
 }
 
 button,
@@ -46,20 +51,23 @@ a {
   justify-content: space-between;
   gap: 16px;
   padding: 18px clamp(16px, 4vw, 36px);
-  background: var(--paper);
-  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, .92);
+  border-bottom: 1px solid rgba(217, 225, 231, .8);
+  backdrop-filter: blur(10px);
 }
 
 .shop-hero {
   justify-content: flex-start;
+  min-height: 118px;
 }
 
 .booth-logo {
-  width: 72px;
-  height: 72px;
+  width: 76px;
+  height: 76px;
   object-fit: cover;
   border-radius: 8px;
-  border: 1px solid var(--line);
+  border: 3px solid #fff;
+  box-shadow: var(--shadow);
 }
 
 h1,
@@ -69,7 +77,8 @@ p {
 }
 
 h1 {
-  font-size: clamp(24px, 3vw, 36px);
+  font-size: clamp(26px, 3vw, 38px);
+  line-height: 1.1;
 }
 
 .shop-hero p,
@@ -82,8 +91,8 @@ h1 {
 .shop-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 360px;
-  gap: 18px;
-  padding: 18px clamp(12px, 3vw, 28px);
+  gap: 20px;
+  padding: 20px clamp(12px, 3vw, 30px);
 }
 
 .catalog-panel,
@@ -94,13 +103,14 @@ h1 {
   background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 8px;
+  box-shadow: var(--shadow);
 }
 
 .toolbar {
   display: grid;
   grid-template-columns: 1fr 180px;
   gap: 12px;
-  padding: 14px;
+  padding: 16px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -109,27 +119,35 @@ select,
 textarea {
   width: 100%;
   border: 1px solid var(--line);
-  border-radius: 6px;
-  padding: 10px 12px;
+  border-radius: 8px;
+  padding: 11px 12px;
   background: #fff;
   color: var(--ink);
 }
 
 .product-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
-  gap: 12px;
-  padding: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 14px;
+  padding: 16px;
 }
 
 .product-card {
+  position: relative;
   display: grid;
   gap: 10px;
-  border: 1px solid var(--line);
+  border: 1px solid rgba(217, 225, 231, .9);
   border-radius: 8px;
   padding: 10px;
   background: #fff;
   min-width: 0;
+  transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+}
+
+.product-card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(16, 132, 126, .34);
+  box-shadow: 0 14px 28px rgba(22, 55, 65, .1);
 }
 
 .product-card.sold-out {
@@ -141,9 +159,9 @@ textarea {
   width: 100%;
   aspect-ratio: 1 / 1;
   object-fit: cover;
-  border-radius: 6px;
+  border-radius: 8px;
   background: #edf2f5;
-  border: 1px solid var(--line);
+  border: 0;
 }
 
 .product-placeholder {
@@ -155,6 +173,7 @@ textarea {
 
 .product-title {
   font-weight: 700;
+  line-height: 1.25;
   word-break: break-word;
 }
 
@@ -175,6 +194,7 @@ textarea {
 .price {
   color: var(--accent);
   font-weight: 800;
+  font-size: 18px;
 }
 
 .primary-btn,
@@ -184,7 +204,7 @@ textarea {
 .ghost-link {
   min-height: 40px;
   border: 1px solid var(--line);
-  border-radius: 6px;
+  border-radius: 8px;
   padding: 9px 12px;
   cursor: pointer;
   text-decoration: none;
@@ -196,6 +216,7 @@ textarea {
   background: var(--brand);
   color: #fff;
   font-weight: 700;
+  box-shadow: 0 8px 18px rgba(16, 132, 126, .18);
 }
 
 .primary-btn:hover {
@@ -210,6 +231,30 @@ textarea {
   color: var(--ink);
 }
 
+.add-btn {
+  width: 100%;
+}
+
+.add-btn.just-added {
+  border-color: var(--accent);
+  background: var(--accent);
+  box-shadow: 0 8px 18px rgba(226, 88, 79, .2);
+}
+
+.in-cart-badge {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 1;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 5px 9px;
+  box-shadow: 0 8px 18px rgba(226, 88, 79, .22);
+}
+
 button:disabled {
   cursor: not-allowed;
   opacity: .52;
@@ -219,7 +264,25 @@ button:disabled {
   position: sticky;
   top: 14px;
   align-self: start;
-  padding: 16px;
+  padding: 18px;
+  border-color: rgba(16, 132, 126, .2);
+}
+
+.cart-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.cart-count {
+  min-width: 30px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 800;
+  text-align: center;
+  padding: 4px 10px;
 }
 
 .cart-items {
@@ -233,6 +296,9 @@ button:disabled {
 .cart-items.empty {
   color: var(--muted);
   padding: 18px 0;
+  border-radius: 8px;
+  background: var(--fresh);
+  text-align: center;
 }
 
 .cart-line {
@@ -240,8 +306,10 @@ button:disabled {
   grid-template-columns: 1fr auto;
   gap: 8px;
   align-items: center;
-  border-bottom: 1px solid var(--line);
-  padding-bottom: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: #fbfcfd;
 }
 
 .qty-controls {
@@ -251,16 +319,17 @@ button:disabled {
 }
 
 .icon-btn {
-  width: 34px;
-  min-height: 34px;
+  width: 36px;
+  min-height: 36px;
   padding: 0;
+  font-weight: 800;
 }
 
 .cart-total {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 0;
+  padding: 14px 0;
   border-top: 1px solid var(--line);
   font-size: 20px;
 }
@@ -287,9 +356,31 @@ button:disabled {
 
 .segmented button.active {
   border-color: var(--brand);
-  background: #e7f5f5;
+  background: var(--fresh);
   color: var(--brand-strong);
   font-weight: 700;
+}
+
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 22px;
+  transform: translate(-50%, 12px);
+  z-index: 50;
+  max-width: min(420px, calc(100vw - 28px));
+  border-radius: 999px;
+  background: rgba(35, 38, 41, .94);
+  color: #fff;
+  padding: 12px 18px;
+  font-weight: 700;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, .22);
+  opacity: 0;
+  transition: opacity .18s ease, transform .18s ease;
+}
+
+.toast.show {
+  opacity: 1;
+  transform: translate(-50%, 0);
 }
 
 .order-dialog {
