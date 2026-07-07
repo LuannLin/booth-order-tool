@@ -4,10 +4,21 @@ const state = {
   cart: new Map(),
   receiveType: "now",
   paymentMethod: "wechat",
+  toastTimer: null,
 };
 
 const money = (value) => `¥${Number(value || 0).toFixed(2)}`;
 const digitsOnly = (value) => value.replace(/\D/g, "");
+
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  }[char]));
+}
 
 async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -51,19 +62,21 @@ function renderProducts() {
   });
   grid.innerHTML = products.map((product) => {
     const soldOut = product.stock <= 0;
+    const inCart = state.cart.get(product.id)?.quantity || 0;
     const tags = [product.category, product.author, product.tags].filter(Boolean).join(" · ");
     return `
       <article class="product-card ${soldOut ? "sold-out" : ""}">
+        ${inCart ? `<div class="in-cart-badge">已选 ${inCart}</div>` : ""}
         ${productImage(product)}
         <div>
-          <div class="product-title">${product.name}</div>
-          <div class="product-meta">${tags || "未分类"}</div>
+          <div class="product-title">${escapeHtml(product.name)}</div>
+          <div class="product-meta">${escapeHtml(tags || "未分类")}</div>
         </div>
         <div class="price-row">
           <span class="price">${money(product.price)}</span>
           <span class="product-meta">库存 ${product.stock}</span>
         </div>
-        <button class="primary-btn" data-add="${product.id}" ${soldOut ? "disabled" : ""}>${soldOut ? "已售罄" : "加入购物车"}</button>
+        <button class="primary-btn add-btn" data-add="${product.id}" ${soldOut ? "disabled" : ""}>${soldOut ? "已售罄" : inCart ? `再加一件 (${inCart})` : "加入购物车"}</button>
       </article>
     `;
   }).join("") || `<p class="small-muted">没有找到商品</p>`;
@@ -92,8 +105,35 @@ function renderCart() {
     `).join("");
   }
   const total = lines.reduce((sum, line) => sum + line.product.price * line.quantity, 0);
+  const count = lines.reduce((sum, line) => sum + line.quantity, 0);
+  const countBadge = document.querySelector("#cartCount");
+  countBadge.hidden = count === 0;
+  countBadge.textContent = count;
   document.querySelector("#cartTotal").textContent = money(total);
   document.querySelector("#submitOrder").disabled = lines.length === 0;
+}
+
+function showToast(message) {
+  const toast = document.querySelector("#toast");
+  toast.textContent = message;
+  toast.hidden = false;
+  toast.classList.add("show");
+  clearTimeout(state.toastTimer);
+  state.toastTimer = setTimeout(() => {
+    toast.classList.remove("show");
+    toast.hidden = true;
+  }, 1400);
+}
+
+function animateAddButton(button, quantity) {
+  const original = button.textContent;
+  button.textContent = `已加入 ×${quantity}`;
+  button.classList.add("just-added");
+  setTimeout(() => {
+    button.classList.remove("just-added");
+    button.textContent = original;
+    renderProducts();
+  }, 520);
 }
 
 function setupPickupTimes() {
@@ -102,14 +142,20 @@ function setupPickupTimes() {
   select.innerHTML = `<option value="">请选择预计领取时间</option>${options.map((item) => `<option value="${item}">${item}</option>`).join("")}`;
 }
 
-function addToCart(productId) {
+function addToCart(productId, button) {
   const product = state.products.find((item) => item.id === productId);
   if (!product || product.stock <= 0) return;
   const existing = state.cart.get(productId) || { product, quantity: 0 };
-  if (existing.quantity >= product.stock) return;
+  if (existing.quantity >= product.stock) {
+    showToast(`${product.name} 已经达到库存上限`);
+    return;
+  }
   existing.quantity += 1;
   state.cart.set(productId, existing);
   renderCart();
+  showToast(`已加入：${product.name} ×${existing.quantity}`);
+  if (button) animateAddButton(button, existing.quantity);
+  else renderProducts();
 }
 
 function changeQuantity(productId, delta) {
@@ -119,6 +165,7 @@ function changeQuantity(productId, delta) {
   if (line.quantity <= 0) state.cart.delete(productId);
   if (line.quantity > line.product.stock) line.quantity = line.product.stock;
   renderCart();
+  renderProducts();
 }
 
 function renderOrder(order) {
@@ -201,7 +248,7 @@ document.addEventListener("click", (event) => {
   const minus = event.target.closest("[data-minus]");
   const receive = event.target.closest("[data-receive]");
   const pay = event.target.closest("[data-pay]");
-  if (add) addToCart(Number(add.dataset.add));
+  if (add) addToCart(Number(add.dataset.add), add);
   if (plus) changeQuantity(Number(plus.dataset.plus), 1);
   if (minus) changeQuantity(Number(minus.dataset.minus), -1);
   if (receive) {
