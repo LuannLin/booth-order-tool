@@ -76,6 +76,8 @@ def init_db() -> None:
                 order_status TEXT NOT NULL DEFAULT 'new',
                 total REAL NOT NULL DEFAULT 0,
                 note TEXT NOT NULL DEFAULT '',
+                picker_name TEXT NOT NULL DEFAULT '',
+                picker_at TEXT NOT NULL DEFAULT '',
                 ready_at TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -88,6 +90,7 @@ def init_db() -> None:
                 name TEXT NOT NULL,
                 price REAL NOT NULL,
                 quantity INTEGER NOT NULL,
+                picked INTEGER NOT NULL DEFAULT 0,
                 author TEXT NOT NULL DEFAULT '',
                 category TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL DEFAULT '',
@@ -102,6 +105,7 @@ def init_db() -> None:
             "wechat_qr": "",
             "alipay_qr": "",
             "admin_password": "123456",
+            "staff_members": "[]",
         }
         for key, value in defaults.items():
             conn.execute(
@@ -115,6 +119,13 @@ def init_db() -> None:
             conn.execute("ALTER TABLE orders ADD COLUMN pickup_time TEXT NOT NULL DEFAULT ''")
         if "ready_at" not in order_columns:
             conn.execute("ALTER TABLE orders ADD COLUMN ready_at TEXT NOT NULL DEFAULT ''")
+        if "picker_name" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN picker_name TEXT NOT NULL DEFAULT ''")
+        if "picker_at" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN picker_at TEXT NOT NULL DEFAULT ''")
+        item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(order_items)").fetchall()}
+        if "picked" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN picked INTEGER NOT NULL DEFAULT 0")
         existing = conn.execute("SELECT COUNT(*) AS c FROM products").fetchone()["c"]
         if existing == 0:
             sample_time = now_text()
@@ -165,7 +176,26 @@ def settings_dict(conn: sqlite3.Connection, public: bool = True) -> dict:
     result = {row["key"]: row["value"] for row in rows}
     if public:
         result.pop("admin_password", None)
+        result.pop("staff_members", None)
     return result
+
+
+def staff_members_from_settings(settings: dict) -> list[str]:
+    raw = settings.get("staff_members", "[]")
+    try:
+        members = json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(members, list):
+        return []
+    clean: list[str] = []
+    seen = set()
+    for member in members:
+        name = str(member).strip()[:30]
+        if name and name not in seen:
+            clean.append(name)
+            seen.add(name)
+    return clean
 
 
 def require_admin(handler: BaseHTTPRequestHandler) -> bool:
@@ -316,6 +346,10 @@ class BoothHandler(BaseHTTPRequestHandler):
                 return write_json(self, 200, list_products(conn, admin=False))
         if path == "/api/admin/me":
             return write_json(self, 200, {"ok": self.is_admin()})
+        if path == "/api/admin/staff-list":
+            with DB_LOCK, connect() as conn:
+                settings = settings_dict(conn, public=False)
+            return write_json(self, 200, {"staff_members": staff_members_from_settings(settings)})
         if path == "/api/admin/products":
             if not require_admin(self):
                 return
@@ -386,6 +420,11 @@ class BoothHandler(BaseHTTPRequestHandler):
                     return
                 order_id = int(path.rsplit("/", 1)[-1])
                 return self.update_order(order_id)
+            if path.startswith("/api/admin/order-items/"):
+                if not require_admin(self):
+                    return
+                item_id = int(path.rsplit("/", 1)[-1])
+                return self.update_order_item(item_id)
         except (ValueError, json.JSONDecodeError) as exc:
             return write_json(self, 400, {"error": str(exc)})
         write_json(self, 404, {"error": "没有找到这个接口"})
@@ -435,13 +474,21 @@ class BoothHandler(BaseHTTPRequestHandler):
     def login(self) -> None:
         payload = read_body(self)
         password = str(payload.get("password", ""))
+        staff_name = str(payload.get("staff_name", "")).strip()[:30]
         with DB_LOCK, connect() as conn:
-            expected = settings_dict(conn, public=False).get("admin_password", "123456")
+            settings = settings_dict(conn, public=False)
+            expected = settings.get("admin_password", "123456")
+            members = staff_members_from_settings(settings)
         if password != expected:
             return write_json(self, 403, {"error": "密码不对"})
+        if members:
+            if not staff_name or staff_name not in members:
+                return write_json(self, 403, {"error": "请选择正确的摊员身份"})
+        elif not staff_name:
+            staff_name = "摊主"
         token = secrets.token_urlsafe(24)
         SESSIONS.add(token)
-        data = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+        data = json.dumps({"ok": True, "staff_name": staff_name}, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Set-Cookie", f"{ADMIN_COOKIE}={token}; Path=/; SameSite=Lax")
@@ -586,6 +633,10 @@ class BoothHandler(BaseHTTPRequestHandler):
         payload = read_body(self)
         allowed_status = {"new", "picking", "ready", "completed", "cancelled"}
         allowed_payment = {"pending", "verified", "cash_pending", "cash_received"}
+        requested_picker = None
+        if "picker_name" in payload:
+            requested_picker = str(payload["picker_name"]).strip()[:30]
+        force_picker = bool(payload.get("force_picker"))
         fields = []
         params = []
         if "order_status" in payload:
@@ -597,6 +648,19 @@ class BoothHandler(BaseHTTPRequestHandler):
             if value == "ready":
                 fields.append("ready_at=?")
                 params.append(now_text())
+            if value == "new":
+                fields.append("picker_name=?")
+                params.append("")
+                fields.append("picker_at=?")
+                params.append("")
+                fields.append("ready_at=?")
+                params.append("")
+        if "picker_name" in payload:
+            value = requested_picker or ""
+            fields.append("picker_name=?")
+            params.append(value)
+            fields.append("picker_at=?")
+            params.append(now_text() if value else "")
         if "payment_status" in payload:
             value = str(payload["payment_status"])
             if value not in allowed_payment:
@@ -609,6 +673,18 @@ class BoothHandler(BaseHTTPRequestHandler):
         params.append(now_text())
         params.append(order_id)
         with DB_LOCK, connect() as conn:
+            current = conn.execute("SELECT picker_name FROM orders WHERE id=?", (order_id,)).fetchone()
+            if not current:
+                return write_json(self, 404, {"error": "璁㈠崟涓嶅瓨鍦?"})
+            if requested_picker and current["picker_name"] and current["picker_name"] != requested_picker and not force_picker:
+                return write_json(
+                    self,
+                    409,
+                    {
+                        "error": f"该订单已由 {current['picker_name']} 拣货中",
+                        "picker_name": current["picker_name"],
+                    },
+                )
             conn.execute(f"UPDATE orders SET {', '.join(fields)} WHERE id=?", params)
             conn.commit()
             detail = order_detail(conn, order_id)
@@ -616,12 +692,28 @@ class BoothHandler(BaseHTTPRequestHandler):
             return write_json(self, 404, {"error": "订单不存在"})
         write_json(self, 200, detail)
 
+    def update_order_item(self, item_id: int) -> None:
+        payload = read_body(self)
+        picked = 1 if bool(payload.get("picked")) else 0
+        with DB_LOCK, connect() as conn:
+            item = conn.execute("SELECT order_id FROM order_items WHERE id=?", (item_id,)).fetchone()
+            if not item:
+                return write_json(self, 404, {"error": "拣货项不存在"})
+            stamp = now_text()
+            conn.execute("UPDATE order_items SET picked=? WHERE id=?", (picked, item_id))
+            conn.execute("UPDATE orders SET updated_at=? WHERE id=?", (stamp, item["order_id"]))
+            conn.commit()
+            detail = order_detail(conn, item["order_id"])
+        write_json(self, 200, detail)
+
     def update_settings(self) -> None:
         payload = read_body(self)
-        allowed = {"booth_name", "welcome", "logo", "wechat_qr", "alipay_qr", "admin_password"}
+        allowed = {"booth_name", "welcome", "logo", "wechat_qr", "alipay_qr", "admin_password", "staff_members"}
         with DB_LOCK, connect() as conn:
             for key, value in payload.items():
                 if key in allowed:
+                    if key == "staff_members":
+                        value = json.dumps(staff_members_from_settings({"staff_members": value}), ensure_ascii=False)
                     conn.execute(
                         "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                         (key, str(value)),
