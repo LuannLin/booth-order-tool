@@ -60,6 +60,8 @@ def init_db() -> None:
                 tags TEXT NOT NULL DEFAULT '',
                 image TEXT NOT NULL DEFAULT '',
                 active INTEGER NOT NULL DEFAULT 1,
+                is_gift INTEGER NOT NULL DEFAULT 0,
+                low_stock_threshold INTEGER NOT NULL DEFAULT 3,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -74,6 +76,8 @@ def init_db() -> None:
                 payment_method TEXT NOT NULL,
                 payment_status TEXT NOT NULL DEFAULT 'pending',
                 order_status TEXT NOT NULL DEFAULT 'new',
+                subtotal REAL NOT NULL DEFAULT 0,
+                discount_total REAL NOT NULL DEFAULT 0,
                 total REAL NOT NULL DEFAULT 0,
                 note TEXT NOT NULL DEFAULT '',
                 picker_name TEXT NOT NULL DEFAULT '',
@@ -91,6 +95,8 @@ def init_db() -> None:
                 price REAL NOT NULL,
                 quantity INTEGER NOT NULL,
                 picked INTEGER NOT NULL DEFAULT 0,
+                item_type TEXT NOT NULL DEFAULT 'sale',
+                promotion_name TEXT NOT NULL DEFAULT '',
                 author TEXT NOT NULL DEFAULT '',
                 category TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL DEFAULT '',
@@ -106,6 +112,7 @@ def init_db() -> None:
             "alipay_qr": "",
             "admin_password": "123456",
             "staff_members": "[]",
+            "promotions": '{"amount_gifts":[],"quantity_gifts":[],"amount_discounts":[]}',
         }
         for key, value in defaults.items():
             conn.execute(
@@ -126,6 +133,21 @@ def init_db() -> None:
         item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(order_items)").fetchall()}
         if "picked" not in item_columns:
             conn.execute("ALTER TABLE order_items ADD COLUMN picked INTEGER NOT NULL DEFAULT 0")
+        if "item_type" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN item_type TEXT NOT NULL DEFAULT 'sale'")
+        if "promotion_name" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN promotion_name TEXT NOT NULL DEFAULT ''")
+        product_columns = {row["name"] for row in conn.execute("PRAGMA table_info(products)").fetchall()}
+        if "is_gift" not in product_columns:
+            conn.execute("ALTER TABLE products ADD COLUMN is_gift INTEGER NOT NULL DEFAULT 0")
+        if "low_stock_threshold" not in product_columns:
+            conn.execute("ALTER TABLE products ADD COLUMN low_stock_threshold INTEGER NOT NULL DEFAULT 3")
+        order_columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
+        if "subtotal" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN subtotal REAL NOT NULL DEFAULT 0")
+            conn.execute("UPDATE orders SET subtotal = total WHERE subtotal = 0")
+        if "discount_total" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN discount_total REAL NOT NULL DEFAULT 0")
         existing = conn.execute("SELECT COUNT(*) AS c FROM products").fetchone()["c"]
         if existing == 0:
             sample_time = now_text()
@@ -198,6 +220,107 @@ def staff_members_from_settings(settings: dict) -> list[str]:
     return clean
 
 
+def clean_promotions(raw_value) -> dict:
+    if isinstance(raw_value, str):
+        try:
+            raw = json.loads(raw_value or "{}")
+        except json.JSONDecodeError:
+            raw = {}
+    elif isinstance(raw_value, dict):
+        raw = raw_value
+    else:
+        raw = {}
+
+    def money_value(value) -> float:
+        return max(0.0, round(float(value or 0), 2))
+
+    def int_value(value) -> int:
+        return max(0, int(value or 0))
+
+    amount_gifts = []
+    for item in raw.get("amount_gifts", []):
+        try:
+            rule = {
+                "name": str(item.get("name") or "满额赠品").strip()[:40],
+                "threshold": money_value(item.get("threshold")),
+                "gift_product_id": int_value(item.get("gift_product_id")),
+                "gift_quantity": max(1, int_value(item.get("gift_quantity"))),
+                "active": bool(item.get("active", True)),
+            }
+        except (TypeError, ValueError):
+            continue
+        if rule["threshold"] > 0 and rule["gift_product_id"] > 0:
+            amount_gifts.append(rule)
+
+    quantity_gifts = []
+    for item in raw.get("quantity_gifts", []):
+        try:
+            trigger_type = str(item.get("trigger_type") or "all").strip()
+            if trigger_type not in {"all", "tag", "products"}:
+                trigger_type = "all"
+            product_ids = item.get("trigger_product_ids") or []
+            if not isinstance(product_ids, list):
+                product_ids = []
+            rule = {
+                "name": str(item.get("name") or "买件赠品").strip()[:40],
+                "trigger_type": trigger_type,
+                "trigger_tag": str(item.get("trigger_tag") or "").strip()[:40],
+                "trigger_product_ids": [int_value(value) for value in product_ids if int_value(value) > 0],
+                "buy_quantity": max(1, int_value(item.get("buy_quantity"))),
+                "gift_product_id": int_value(item.get("gift_product_id")),
+                "gift_quantity": max(1, int_value(item.get("gift_quantity"))),
+                "active": bool(item.get("active", True)),
+            }
+        except (TypeError, ValueError):
+            continue
+        if rule["gift_product_id"] > 0:
+            quantity_gifts.append(rule)
+
+    amount_discounts = []
+    for item in raw.get("amount_discounts", []):
+        try:
+            rule = {
+                "name": str(item.get("name") or "满额减价").strip()[:40],
+                "threshold": money_value(item.get("threshold")),
+                "discount": money_value(item.get("discount")),
+                "active": bool(item.get("active", True)),
+            }
+        except (TypeError, ValueError):
+            continue
+        if rule["threshold"] > 0 and rule["discount"] > 0:
+            amount_discounts.append(rule)
+
+    return {
+        "amount_gifts": amount_gifts,
+        "quantity_gifts": quantity_gifts,
+        "amount_discounts": amount_discounts,
+    }
+
+
+def promotions_from_settings(settings: dict) -> dict:
+    return clean_promotions(settings.get("promotions", "{}"))
+
+
+def split_tags(value: str) -> set[str]:
+    normalized = value.replace("，", ",").replace("、", ",").replace("；", ",").replace(";", ",")
+    return {item.strip() for item in normalized.split(",") if item.strip()}
+
+
+def quantity_rule_matches(product: sqlite3.Row, rule: dict) -> bool:
+    trigger_type = rule.get("trigger_type", "all")
+    if trigger_type == "tag":
+        tag = str(rule.get("trigger_tag") or "").strip()
+        if not tag:
+            return False
+        if tag in split_tags(str(product["tags"])):
+            return True
+        searchable = " ".join(str(product[key] or "") for key in ("name", "category", "author", "tags"))
+        return tag in searchable
+    if trigger_type == "products":
+        return int(product["id"]) in set(rule.get("trigger_product_ids", []))
+    return True
+
+
 def require_admin(handler: BaseHTTPRequestHandler) -> bool:
     jar = cookies.SimpleCookie(handler.headers.get("Cookie"))
     token = jar.get(ADMIN_COOKIE)
@@ -210,14 +333,15 @@ def require_admin(handler: BaseHTTPRequestHandler) -> bool:
 def row_to_product(row: sqlite3.Row) -> dict:
     data = dict(row)
     data["active"] = bool(data["active"])
+    data["is_gift"] = bool(data.get("is_gift", 0))
     return data
 
 
 def list_products(conn: sqlite3.Connection, admin: bool = False) -> list[dict]:
     query = "SELECT * FROM products"
     if not admin:
-        query += " WHERE active = 1"
-    query += " ORDER BY category, author, id DESC"
+        query += " WHERE active = 1 AND is_gift = 0"
+    query += " ORDER BY is_gift, CASE WHEN stock <= 0 THEN 1 ELSE 0 END, category, author, id DESC"
     return [row_to_product(row) for row in conn.execute(query).fetchall()]
 
 
@@ -274,9 +398,17 @@ def sales_stats(conn: sqlite3.Connection, order_date: str = "") -> dict:
         SELECT
             COUNT(DISTINCT o.id) AS order_count,
             COALESCE(SUM(oi.quantity), 0) AS sold_quantity,
-            COALESCE(ROUND(SUM(oi.price * oi.quantity), 2), 0) AS sales_total
+            0 AS sales_total
         FROM orders o
         LEFT JOIN order_items oi ON oi.order_id = o.id
+        {where}
+        """,
+        params,
+    ).fetchone()
+    revenue = conn.execute(
+        f"""
+        SELECT COALESCE(ROUND(SUM(o.total), 2), 0) AS sales_total
+        FROM orders o
         {where}
         """,
         params,
@@ -287,13 +419,14 @@ def sales_stats(conn: sqlite3.Connection, order_date: str = "") -> dict:
             oi.name,
             oi.author,
             oi.category,
+            oi.item_type,
             oi.price,
             SUM(oi.quantity) AS sold_quantity,
             ROUND(SUM(oi.price * oi.quantity), 2) AS sales_total
         FROM order_items oi
         JOIN orders o ON o.id = oi.order_id
         {where}
-        GROUP BY oi.name, oi.author, oi.category, oi.price
+        GROUP BY oi.name, oi.author, oi.category, oi.item_type, oi.price
         ORDER BY sales_total DESC, sold_quantity DESC, oi.name
         """,
         params,
@@ -301,13 +434,13 @@ def sales_stats(conn: sqlite3.Connection, order_date: str = "") -> dict:
     return {
         "order_count": totals["order_count"],
         "sold_quantity": totals["sold_quantity"],
-        "sales_total": totals["sales_total"],
+        "sales_total": revenue["sales_total"],
         "products": [dict(row) for row in products],
         "orders": list_orders(conn, order_date=order_date),
     }
 
 
-def validate_product_payload(payload: dict) -> tuple[str, float, int, str, str, str, str, bool]:
+def validate_product_payload(payload: dict) -> tuple[str, float, int, str, str, str, str, bool, int, bool]:
     name = str(payload.get("name", "")).strip()
     if not name:
         raise ValueError("商品名不能为空")
@@ -320,7 +453,11 @@ def validate_product_payload(payload: dict) -> tuple[str, float, int, str, str, 
     tags = str(payload.get("tags", "")).strip()
     image = str(payload.get("image", "")).strip()
     active = bool(payload.get("active", True))
-    return name, price, stock, category, author, tags, image, active
+    is_gift = bool(payload.get("is_gift", False))
+    low_stock_threshold = int(payload.get("low_stock_threshold", 3))
+    if low_stock_threshold < 0:
+        low_stock_threshold = 0
+    return name, price, stock, category, author, tags, image, is_gift, low_stock_threshold, active
 
 
 class BoothHandler(BaseHTTPRequestHandler):
@@ -393,7 +530,7 @@ class BoothHandler(BaseHTTPRequestHandler):
             if path == "/api/admin/logout":
                 return self.logout()
             if path == "/api/orders":
-                return self.create_order()
+                return self.create_order_v2()
             if path == "/api/admin/products":
                 if not require_admin(self):
                     return
@@ -507,6 +644,174 @@ class BoothHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"ok": true}')
 
+    def create_order_v2(self) -> None:
+        payload = read_body(self)
+        items = payload.get("items", [])
+        if not isinstance(items, list) or not items:
+            raise ValueError("购物车是空的")
+        receive_type = str(payload.get("receive_type", "now"))
+        phone = str(payload.get("phone", "")).strip()
+        phone_tail = str(payload.get("phone_tail", "")).strip()
+        pickup_time = str(payload.get("pickup_time", "")).strip()
+        payment_method = str(payload.get("payment_method", "wechat"))
+        note = str(payload.get("note", "")).strip()
+        if receive_type not in {"now", "later"}:
+            raise ValueError("领取方式不正确")
+        if receive_type == "later" and (not phone.isdigit() or len(phone) != 11):
+            raise ValueError("请填写正确的手机号")
+        if receive_type == "now" and (not phone_tail.isdigit() or len(phone_tail) != 4):
+            raise ValueError("现在领取请填写手机号后四位")
+        if receive_type == "later" and not pickup_time:
+            raise ValueError("稍后领取需要选择预计领取时间")
+        if receive_type == "later":
+            phone_tail = phone[-4:]
+        else:
+            phone = ""
+            pickup_time = ""
+        if payment_method not in {"wechat", "alipay", "cash"}:
+            raise ValueError("支付方式不正确")
+
+        with DB_LOCK, connect() as conn:
+            requested: dict[int, int] = {}
+            for item in items:
+                product_id = int(item.get("product_id"))
+                quantity = int(item.get("quantity", 1))
+                if quantity <= 0:
+                    raise ValueError("数量不正确")
+                requested[product_id] = requested.get(product_id, 0) + quantity
+
+            product_ids = list(requested.keys())
+            placeholders = ",".join("?" for _ in product_ids)
+            rows = conn.execute(
+                f"SELECT * FROM products WHERE id IN ({placeholders}) AND active = 1",
+                product_ids,
+            ).fetchall()
+            products = {row["id"]: row for row in rows}
+            clean_items = []
+            subtotal = 0.0
+            sale_quantity = 0
+            for product_id, quantity in requested.items():
+                product = products.get(product_id)
+                if not product or int(product["is_gift"]):
+                    raise ValueError("有商品已经下架")
+                if product["stock"] < quantity:
+                    raise ValueError(f"{product['name']} 库存不够了")
+                subtotal += round(float(product["price"]) * quantity, 2)
+                sale_quantity += quantity
+                clean_items.append((product, quantity))
+
+            promotions = promotions_from_settings(settings_dict(conn, public=False))
+            gift_rule_ids = sorted({
+                rule["gift_product_id"]
+                for group in ("amount_gifts", "quantity_gifts")
+                for rule in promotions[group]
+                if rule["active"] and rule["gift_product_id"] > 0
+            })
+            gift_rows = []
+            if gift_rule_ids:
+                gift_placeholders = ",".join("?" for _ in gift_rule_ids)
+                gift_rows = conn.execute(
+                    f"SELECT * FROM products WHERE id IN ({gift_placeholders})",
+                    gift_rule_ids,
+                ).fetchall()
+            gifts = {row["id"]: row for row in gift_rows}
+            gift_stock_left = {row["id"]: int(row["stock"]) for row in gift_rows}
+            gift_items = []
+            disabled_gift_ids: set[int] = set()
+
+            def claim_gift(rule: dict) -> sqlite3.Row | None:
+                product_id = int(rule["gift_product_id"])
+                quantity = int(rule["gift_quantity"])
+                gift = gifts.get(product_id)
+                remaining = gift_stock_left.get(product_id, 0)
+                if not gift or not int(gift["active"]) or not int(gift["is_gift"]):
+                    disabled_gift_ids.add(product_id)
+                    return None
+                if remaining < quantity:
+                    if remaining <= 0:
+                        disabled_gift_ids.add(product_id)
+                    return None
+                gift_stock_left[product_id] = remaining - quantity
+                if gift_stock_left[product_id] <= 0:
+                    disabled_gift_ids.add(product_id)
+                return gift
+
+            for rule in promotions["amount_gifts"]:
+                if rule["active"] and subtotal >= rule["threshold"]:
+                    gift = claim_gift(rule)
+                    if gift:
+                        gift_items.append((gift, rule["gift_quantity"], rule["name"]))
+            for rule in promotions["quantity_gifts"]:
+                matched_quantity = sum(quantity for product, quantity in clean_items if quantity_rule_matches(product, rule))
+                if rule["active"] and matched_quantity >= rule["buy_quantity"]:
+                    gift = claim_gift(rule)
+                    if gift:
+                        gift_items.append((gift, rule["gift_quantity"], rule["name"]))
+
+            promotions_dirty = False
+            if disabled_gift_ids:
+                for group in ("amount_gifts", "quantity_gifts"):
+                    for rule in promotions[group]:
+                        if rule["active"] and rule["gift_product_id"] in disabled_gift_ids:
+                            rule["active"] = False
+                            promotions_dirty = True
+
+            discount_total = 0.0
+            for rule in promotions["amount_discounts"]:
+                if rule["active"] and subtotal >= rule["threshold"]:
+                    discount_total += rule["discount"]
+            subtotal = round(subtotal, 2)
+            discount_total = min(round(discount_total, 2), subtotal)
+            total = round(max(0.0, subtotal - discount_total), 2)
+
+            pickup_code = generate_pickup_code(conn)
+            created = now_text()
+            payment_status = "cash_pending" if payment_method == "cash" else "pending"
+            cur = conn.execute(
+                """
+                INSERT INTO orders(pickup_code, receive_type, phone, phone_tail, pickup_time, payment_method, payment_status, order_status, subtotal, discount_total, total, note, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?)
+                """,
+                (pickup_code, receive_type, phone, phone_tail, pickup_time, payment_method, payment_status, subtotal, discount_total, total, note, created, created),
+            )
+            order_id = cur.lastrowid
+
+            for product, quantity in clean_items:
+                conn.execute(
+                    """
+                    INSERT INTO order_items(order_id, product_id, name, price, quantity, item_type, promotion_name, author, category, tags)
+                    VALUES(?, ?, ?, ?, ?, 'sale', '', ?, ?, ?)
+                    """,
+                    (order_id, product["id"], product["name"], product["price"], quantity, product["author"], product["category"], product["tags"]),
+                )
+                conn.execute(
+                    "UPDATE products SET stock = stock - ?, updated_at = ? WHERE id = ?",
+                    (quantity, created, product["id"]),
+                )
+
+            for product, quantity, promotion_name in gift_items:
+                conn.execute(
+                    """
+                    INSERT INTO order_items(order_id, product_id, name, price, quantity, item_type, promotion_name, author, category, tags)
+                    VALUES(?, ?, ?, 0, ?, 'gift', ?, ?, ?, ?)
+                    """,
+                    (order_id, product["id"], product["name"], quantity, promotion_name, product["author"], product["category"], product["tags"]),
+                )
+                conn.execute(
+                    "UPDATE products SET stock = stock - ?, updated_at = ? WHERE id = ?",
+                    (quantity, created, product["id"]),
+                )
+
+            if promotions_dirty:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES('promotions', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (json.dumps(clean_promotions(promotions), ensure_ascii=False),),
+                )
+
+            conn.commit()
+            detail = order_detail(conn, order_id)
+        write_json(self, 201, detail)
+
     def create_order(self) -> None:
         payload = read_body(self)
         items = payload.get("items", [])
@@ -601,8 +906,8 @@ class BoothHandler(BaseHTTPRequestHandler):
         with DB_LOCK, connect() as conn:
             cur = conn.execute(
                 """
-                INSERT INTO products(name, price, stock, category, author, tags, image, active, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO products(name, price, stock, category, author, tags, image, is_gift, low_stock_threshold, active, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (*fields, stamp, stamp),
             )
@@ -618,7 +923,7 @@ class BoothHandler(BaseHTTPRequestHandler):
             conn.execute(
                 """
                 UPDATE products
-                SET name=?, price=?, stock=?, category=?, author=?, tags=?, image=?, active=?, updated_at=?
+                SET name=?, price=?, stock=?, category=?, author=?, tags=?, image=?, is_gift=?, low_stock_threshold=?, active=?, updated_at=?
                 WHERE id=?
                 """,
                 (*fields, stamp, product_id),
@@ -708,12 +1013,14 @@ class BoothHandler(BaseHTTPRequestHandler):
 
     def update_settings(self) -> None:
         payload = read_body(self)
-        allowed = {"booth_name", "welcome", "logo", "wechat_qr", "alipay_qr", "admin_password", "staff_members"}
+        allowed = {"booth_name", "welcome", "logo", "wechat_qr", "alipay_qr", "admin_password", "staff_members", "promotions"}
         with DB_LOCK, connect() as conn:
             for key, value in payload.items():
                 if key in allowed:
                     if key == "staff_members":
                         value = json.dumps(staff_members_from_settings({"staff_members": value}), ensure_ascii=False)
+                    if key == "promotions":
+                        value = json.dumps(clean_promotions(value), ensure_ascii=False)
                     conn.execute(
                         "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                         (key, str(value)),
@@ -728,7 +1035,7 @@ class BoothHandler(BaseHTTPRequestHandler):
                 """
                 SELECT
                     o.pickup_code, o.created_at, o.order_status, o.payment_method, o.payment_status,
-                    o.receive_type, o.phone, o.phone_tail, o.pickup_time, oi.name, oi.price, oi.quantity,
+                    o.receive_type, o.phone, o.phone_tail, o.pickup_time, oi.name, oi.item_type, oi.promotion_name, oi.price, oi.quantity,
                     ROUND(oi.price * oi.quantity, 2) AS line_total,
                     oi.author, oi.category, oi.tags, o.total
                 FROM orders o
@@ -740,6 +1047,10 @@ class BoothHandler(BaseHTTPRequestHandler):
         header = [
             "取单码", "下单时间", "订单状态", "支付方式", "支付状态", "领取方式", "电话", "尾号", "预计领取时间",
             "商品名", "单价", "数量", "小计", "作者", "分类", "标签", "订单总价",
+        ]
+        header = [
+            "取单码", "下单时间", "订单状态", "支付方式", "支付状态", "领取方式", "电话", "尾号", "预计领取时间",
+            "商品名", "类型", "促销规则", "单价", "数量", "小计", "作者", "分类", "标签", "订单总价",
         ]
         output.append(header)
         for row in rows:
@@ -765,24 +1076,31 @@ class BoothHandler(BaseHTTPRequestHandler):
                     oi.author,
                     oi.category,
                     oi.tags,
+                    oi.item_type,
                     oi.price,
                     SUM(oi.quantity) AS sold_quantity,
                     ROUND(SUM(oi.price * oi.quantity), 2) AS sales_total
                 FROM order_items oi
                 JOIN orders o ON o.id = oi.order_id
                 WHERE o.order_status != 'cancelled'
-                GROUP BY oi.name, oi.author, oi.category, oi.tags, oi.price
-                ORDER BY oi.author, oi.category, oi.name, oi.price
+                GROUP BY oi.name, oi.author, oi.category, oi.tags, oi.item_type, oi.price
+                ORDER BY oi.author, oi.category, oi.item_type, oi.name, oi.price
                 """
             ).fetchall()
             total = conn.execute(
                 """
                 SELECT
-                    COALESCE(SUM(oi.quantity), 0) AS sold_quantity,
-                    COALESCE(ROUND(SUM(oi.price * oi.quantity), 2), 0) AS sales_total
-                FROM order_items oi
-                JOIN orders o ON o.id = oi.order_id
-                WHERE o.order_status != 'cancelled'
+                    (
+                        SELECT COALESCE(SUM(oi.quantity), 0)
+                        FROM order_items oi
+                        JOIN orders o ON o.id = oi.order_id
+                        WHERE o.order_status != 'cancelled'
+                    ) AS sold_quantity,
+                    (
+                        SELECT COALESCE(ROUND(SUM(o.total), 2), 0)
+                        FROM orders o
+                        WHERE o.order_status != 'cancelled'
+                    ) AS sales_total
                 """
             ).fetchone()
         output = [["商品名", "作者", "分类", "标签", "单价", "销量", "营业额"]]
