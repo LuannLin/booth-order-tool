@@ -9,7 +9,7 @@
 <body class="shop-body">
   <header class="shop-hero">
     <img id="boothLogo" class="booth-logo" alt="" hidden>
-    <div>
+    <div class="booth-copy">
       <h1 id="boothName">摊位点单</h1>
       <p id="welcome">欢迎光临</p>
     </div>
@@ -17,6 +17,13 @@
 
   <main class="shop-layout">
     <section class="catalog-panel">
+      <div class="catalog-heading">
+        <div>
+          <span class="section-kicker">现场制品</span>
+          <h2>制品一览</h2>
+        </div>
+        <span id="productCount" class="catalog-count">0 件制品</span>
+      </div>
       <div class="toolbar">
         <input id="searchInput" type="search" placeholder="搜索商品、作者、标签">
         <select id="categoryFilter"><option value="">全部分类</option></select>
@@ -26,8 +33,11 @@
 
     <aside class="cart-panel">
       <div class="cart-heading">
-        <h2>购物车</h2>
-        <span id="cartCount" class="cart-count" hidden>0</span>
+        <div>
+          <span class="section-kicker">本次点单</span>
+          <h2>购物车</h2>
+        </div>
+        <span id="cartCount" class="cart-count" hidden>0 件</span>
       </div>
       <div id="cartItems" class="cart-items empty">还没有选择商品</div>
       <div class="cart-total">
@@ -66,8 +76,16 @@
 
   <dialog id="orderDialog" class="order-dialog">
     <div id="orderResult"></div>
-    <button id="closeDialog" class="primary-btn" type="button">我记住了</button>
+    <div class="dialog-actions">
+      <button id="closeDialog" class="primary-btn" type="button">我已截图</button>
+    </div>
   </dialog>
+
+  <button id="cartShortcut" class="cart-shortcut" type="button" hidden>
+    <span>查看购物车</span>
+    <strong id="shortcutTotal">¥0.00</strong>
+    <span id="shortcutCount" class="cart-shortcut-count">0</span>
+  </button>
 
   <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
