@@ -31,7 +31,7 @@ async function api(path, options = {}) {
 }
 
 function productImage(product) {
-  if (product.image) return `<img class="product-image" src="${product.image}" alt="${product.name}">`;
+  if (product.image) return `<img class="product-image" src="${product.image}" alt="${escapeHtml(product.name)}">`;
   return `<div class="product-image product-placeholder">暂无图片</div>`;
 }
 
@@ -52,6 +52,24 @@ function renderFilters() {
   select.innerHTML = `<option value="">全部分类</option>${categories.map((c) => `<option value="${c}">${c}</option>`).join("")}`;
 }
 
+function selectedQuantity(productId) {
+  return state.cart.get(productId)?.quantity || 0;
+}
+
+function availableStock(product) {
+  return Math.max(0, Number(product.stock || 0) - selectedQuantity(product.id));
+}
+
+function stockText(product) {
+  const stock = Number(product.stock || 0);
+  const available = availableStock(product);
+  const threshold = product.low_stock_threshold ?? 3;
+  if (stock <= 0) return "库存 0";
+  if (available <= 0) return "已选完";
+  if (available <= threshold) return `仅剩 ${available} 件`;
+  return `剩余 ${available} 件`;
+}
+
 function renderProducts() {
   const search = document.querySelector("#searchInput").value.trim().toLowerCase();
   const category = document.querySelector("#categoryFilter").value;
@@ -59,24 +77,32 @@ function renderProducts() {
   const products = state.products.filter((product) => {
     const text = `${product.name} ${product.author} ${product.tags} ${product.category}`.toLowerCase();
     return (!category || product.category === category) && (!search || text.includes(search));
-  });
+  }).sort((a, b) => Number(a.stock <= 0) - Number(b.stock <= 0));
+  const count = document.querySelector("#productCount");
+  if (count) count.textContent = `${products.length} 件制品`;
   grid.innerHTML = products.map((product) => {
     const soldOut = product.stock <= 0;
-    const inCart = state.cart.get(product.id)?.quantity || 0;
+    const inCart = selectedQuantity(product.id);
+    const canAdd = availableStock(product) > 0;
     const tags = [product.category, product.author, product.tags].filter(Boolean).join(" · ");
     return `
       <article class="product-card ${soldOut ? "sold-out" : ""}">
-        ${inCart ? `<div class="in-cart-badge">已选 ${inCart}</div>` : ""}
-        ${productImage(product)}
-        <div>
+        <div class="product-media">
+          ${productImage(product)}
+          ${inCart ? `<div class="in-cart-badge">已选 ${inCart}</div>` : ""}
+          ${soldOut ? `<span class="sold-out-badge">已售罄</span>` : ""}
+        </div>
+        <div class="product-copy">
           <div class="product-title">${escapeHtml(product.name)}</div>
           <div class="product-meta">${escapeHtml(tags || "未分类")}</div>
         </div>
-        <div class="price-row">
-          <span class="price">${money(product.price)}</span>
-          <span class="product-meta">库存 ${product.stock}</span>
+        <div class="product-footer">
+          <div class="price-row">
+            <span class="price">${money(product.price)}</span>
+            <span class="stock-text ${availableStock(product) <= (product.low_stock_threshold ?? 3) ? "low" : ""}">${stockText(product)}</span>
+          </div>
+          <button class="primary-btn add-btn" data-add="${product.id}" type="button" title="${canAdd ? "加入购物车" : stockText(product)}" aria-label="${canAdd ? `加入购物车：${escapeHtml(product.name)}` : stockText(product)}" ${canAdd ? "" : "disabled"}>${soldOut ? "售罄" : canAdd ? "+" : "选完"}</button>
         </div>
-        <button class="primary-btn add-btn" data-add="${product.id}" ${soldOut ? "disabled" : ""}>${soldOut ? "已售罄" : inCart ? `再加一件 (${inCart})` : "加入购物车"}</button>
       </article>
     `;
   }).join("") || `<p class="small-muted">没有找到商品</p>`;
@@ -92,14 +118,14 @@ function renderCart() {
     box.className = "cart-items";
     box.innerHTML = lines.map(({ product, quantity }) => `
       <div class="cart-line">
-        <div>
-          <strong>${product.name}</strong>
-          <div class="product-meta">${money(product.price)} / 件</div>
+        <div class="cart-line-copy">
+          <strong>${escapeHtml(product.name)}</strong>
+          <div class="product-meta">${money(product.price)} / 件 · 剩余 ${Math.max(0, product.stock - quantity)} 件</div>
         </div>
         <div class="qty-controls">
           <button class="icon-btn" data-minus="${product.id}" type="button">-</button>
           <span>${quantity}</span>
-          <button class="icon-btn" data-plus="${product.id}" type="button">+</button>
+          <button class="icon-btn" data-plus="${product.id}" type="button" ${quantity >= product.stock ? "disabled" : ""}>+</button>
         </div>
       </div>
     `).join("");
@@ -108,8 +134,14 @@ function renderCart() {
   const count = lines.reduce((sum, line) => sum + line.quantity, 0);
   const countBadge = document.querySelector("#cartCount");
   countBadge.hidden = count === 0;
-  countBadge.textContent = count;
+  countBadge.textContent = `${count} 件`;
   document.querySelector("#cartTotal").textContent = money(total);
+  const shortcut = document.querySelector("#cartShortcut");
+  if (shortcut) {
+    shortcut.hidden = count === 0;
+    document.querySelector("#shortcutCount").textContent = count;
+    document.querySelector("#shortcutTotal").textContent = money(total);
+  }
   document.querySelector("#submitOrder").disabled = lines.length === 0;
 }
 
@@ -127,7 +159,8 @@ function showToast(message) {
 
 function animateAddButton(button, quantity) {
   const original = button.textContent;
-  button.textContent = `已加入 ×${quantity}`;
+  button.textContent = "✓";
+  button.setAttribute("aria-label", `已加入，购物车内共 ${quantity} 件`);
   button.classList.add("just-added");
   setTimeout(() => {
     button.classList.remove("just-added");
@@ -153,9 +186,10 @@ function addToCart(productId, button) {
   existing.quantity += 1;
   state.cart.set(productId, existing);
   renderCart();
+  renderProducts();
   showToast(`已加入：${product.name} ×${existing.quantity}`);
-  if (button) animateAddButton(button, existing.quantity);
-  else renderProducts();
+  const nextButton = document.querySelector(`[data-add="${productId}"]`);
+  if (nextButton && !nextButton.disabled) animateAddButton(nextButton, existing.quantity);
 }
 
 function changeQuantity(productId, delta) {
@@ -168,22 +202,79 @@ function changeQuantity(productId, delta) {
   renderProducts();
 }
 
+function giftBadge(item) {
+  return item?.item_type === "gift" ? `<span class="gift-badge">赠品</span>` : "";
+}
+
+function orderPriceDetails(order) {
+  const subtotal = Number(order.subtotal || order.total || 0);
+  const discount = Number(order.discount_total || 0);
+  const total = Number(order.total || 0);
+  if (discount <= 0) {
+    return `<p class="order-total-line"><strong>合计 ${money(total)}</strong></p>`;
+  }
+  return `
+    <div class="price-breakdown">
+      <div><span>原价</span><strong>${money(subtotal)}</strong></div>
+      <div class="discount"><span>满减</span><strong>- ${money(discount)}</strong></div>
+      <div class="final"><span>优惠后</span><strong>${money(total)}</strong></div>
+    </div>
+  `;
+}
+
 function renderOrder(order) {
   const payText = { wechat: "微信", alipay: "支付宝", cash: "现金" }[order.payment_method];
   const receiveText = { now: "现在领取", later: "稍后领取" }[order.receive_type];
   const qr = [];
   if (order.payment_method === "wechat" && state.settings.wechat_qr) qr.push(["微信收款码", state.settings.wechat_qr]);
   if (order.payment_method === "alipay" && state.settings.alipay_qr) qr.push(["支付宝收款码", state.settings.alipay_qr]);
+  const contact = order.phone
+    ? `<div><span>联系电话</span><strong>${escapeHtml(order.phone)}</strong></div>`
+    : order.phone_tail
+      ? `<div><span>核对尾号</span><strong>${escapeHtml(order.phone_tail)}</strong></div>`
+      : "";
+  const logo = state.settings.logo
+    ? `<img class="receipt-logo" src="${state.settings.logo}" alt="">`
+    : `<span class="receipt-mark">票</span>`;
   document.querySelector("#orderResult").innerHTML = `
-    <p class="small-muted">下单成功，请保存取单码</p>
-    <div class="pickup-code">${order.pickup_code}</div>
-    <p><strong>合计 ${money(order.total)}</strong> · ${receiveText} · ${payText}</p>
-    ${order.phone ? `<p class="small-muted">联系电话：${order.phone}</p>` : ""}
-    ${order.phone_tail ? `<p class="small-muted">核对尾号：${order.phone_tail}</p>` : ""}
-    ${order.pickup_time ? `<p class="small-muted">预计领取：${order.pickup_time}</p>` : ""}
-    ${qr.length ? `<div class="qr-row">${qr.map(([label, src]) => `<div class="qr-box"><img src="${src}" alt="${label}"><strong>${label}</strong></div>`).join("")}</div>` : ""}
-    <p class="small-muted">${order.payment_method === "cash" ? "现金订单请在取货时付款。" : "请完成付款，取货时向摊主出示付款成功页面。"}</p>
-    <ol class="order-items">${order.items.map((item) => `<li>${item.name} × ${item.quantity}，${money(item.price)} / 件</li>`).join("")}</ol>
+    <article class="receipt">
+      <header class="receipt-header">
+        ${logo}
+        <div>
+          <strong>${escapeHtml(state.settings.booth_name || "摊位点单")}</strong>
+          <span>取单凭证</span>
+        </div>
+      </header>
+      <div class="receipt-divider"></div>
+      <section class="receipt-code-block">
+        <span>取单码</span>
+        <div class="pickup-code">${escapeHtml(order.pickup_code)}</div>
+        <p>请截图保存，取货时出示</p>
+      </section>
+      <div class="receipt-meta">
+        <div><span>领取方式</span><strong>${receiveText}</strong></div>
+        <div><span>支付方式</span><strong>${payText}</strong></div>
+        ${contact}
+        ${order.pickup_time ? `<div><span>预计领取</span><strong>${escapeHtml(order.pickup_time)}</strong></div>` : ""}
+      </div>
+      ${qr.length ? `<div class="qr-row">${qr.map(([label, src]) => `<div class="qr-box"><img src="${src}" alt="${label}"><strong>${label}</strong></div>`).join("")}</div>` : ""}
+      <p class="receipt-payment-note">${order.payment_method === "cash" ? "现金订单请在取货时付款" : "请完成付款，取货时出示付款成功页面"}</p>
+      <div class="receipt-divider"></div>
+      <section class="receipt-items">
+        <div class="receipt-table-head"><span>制品</span><span>数量</span><span>单价</span></div>
+        ${order.items.map((item) => {
+      const promo = item.item_type === "gift" && item.promotion_name ? ` <span class="item-promo">来自：${escapeHtml(item.promotion_name)}</span>` : "";
+          return `<div class="receipt-item"><span>${giftBadge(item)}${escapeHtml(item.name)}${promo}</span><strong>× ${item.quantity}</strong><span>${Number(item.price) === 0 ? "赠送" : money(item.price)}</span></div>`;
+        }).join("")}
+      </section>
+      ${orderPriceDetails(order)}
+      <div class="receipt-divider"></div>
+      <div class="order-reminders">
+        <p><strong>截图：</strong>忘记取单码的话，摊主也帮不了你哦。</p>
+        <p><strong>清点：</strong>离摊前请对照清单清点制品数量。</p>
+      </div>
+      <footer class="receipt-footer">谢谢光临 · 漫展快乐</footer>
+    </article>
   `;
   document.querySelector("#orderDialog").showModal();
 }
@@ -283,6 +374,17 @@ document.querySelector("#phoneTailInput").addEventListener("input", (event) => {
 document.querySelector("#clearPickupTime").addEventListener("click", () => {
   document.querySelector("#pickupTimeInput").value = "";
 });
+document.querySelector("#cartShortcut").addEventListener("click", () => {
+  document.querySelector(".cart-panel").scrollIntoView({ behavior: "smooth", block: "start" });
+});
+
+if ("IntersectionObserver" in window) {
+  const shortcut = document.querySelector("#cartShortcut");
+  const cartPanel = document.querySelector(".cart-panel");
+  new IntersectionObserver(([entry]) => {
+    shortcut.classList.toggle("at-cart", entry.isIntersecting);
+  }, { threshold: 0.15 }).observe(cartPanel);
+}
 
 setupPickupTimes();
 load().catch((error) => alert(error.message));
