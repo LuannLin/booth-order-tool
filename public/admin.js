@@ -8,6 +8,7 @@ const adminState = {
   settingImages: {},
   mounted: false,
   settingsDirty: false,
+  promotionsDirty: false,
   audioContext: null,
   orderDate: "",
   salesDate: "",
@@ -53,6 +54,56 @@ function staffMembers() {
   } catch (error) {
     return [];
   }
+}
+
+function promotions() {
+  try {
+    const data = JSON.parse(adminState.settings.promotions || "{}");
+    return {
+      amount_gifts: Array.isArray(data.amount_gifts) ? data.amount_gifts : [],
+      quantity_gifts: Array.isArray(data.quantity_gifts) ? data.quantity_gifts : [],
+      amount_discounts: Array.isArray(data.amount_discounts) ? data.amount_discounts : [],
+    };
+  } catch (error) {
+    return { amount_gifts: [], quantity_gifts: [], amount_discounts: [] };
+  }
+}
+
+function giftOptions(selectedId = 0) {
+  const gifts = adminState.products.filter((product) => product.is_gift);
+  return [`<option value="">选择赠品</option>`, ...gifts.map((product) => (
+    `<option value="${product.id}" ${Number(selectedId) === product.id ? "selected" : ""}>${escapeHtml(product.name)}（库存 ${product.stock}${Number(product.stock || 0) <= 0 ? "，已送完" : ""}）</option>`
+  ))].join("");
+}
+
+function promoGiftOptions(selectedId = 0) {
+  const gifts = adminState.products.filter((product) => product.is_gift);
+  if (!gifts.length) return `<option value="">先添加赠品商品</option>`;
+  return [`<option value="">选择赠品</option>`, ...gifts.map((product) => (
+    `<option value="${product.id}" ${Number(selectedId) === product.id ? "selected" : ""}>${escapeHtml(product.name)}（库存 ${product.stock}${Number(product.stock || 0) <= 0 ? "，已送完" : ""}）</option>`
+  ))].join("");
+}
+
+function promoProductOptions(selectedIds = []) {
+  const selected = new Set((selectedIds || []).map(Number));
+  return adminState.products.filter((product) => !product.is_gift).map((product) => (
+    `<option value="${product.id}" ${selected.has(product.id) ? "selected" : ""}>${escapeHtml(product.name)}（${escapeHtml(product.tags || "无标签")}）</option>`
+  )).join("");
+}
+
+function promoGiftOptions(selectedId = 0) {
+  const gifts = adminState.products.filter((product) => product.is_gift);
+  if (!gifts.length) return `<option value="">先添加赠品商品</option>`;
+  return [`<option value="">选择赠品</option>`, ...gifts.map((product) => (
+    `<option value="${product.id}" ${Number(selectedId) === product.id ? "selected" : ""}>${escapeHtml(product.name)}（库存 ${product.stock}${Number(product.stock || 0) <= 0 ? "，已送完" : ""}）</option>`
+  ))].join("");
+}
+
+function promoProductOptions(selectedIds = []) {
+  const selected = new Set((selectedIds || []).map(Number));
+  return adminState.products.filter((product) => !product.is_gift).map((product) => (
+    `<option value="${product.id}" ${selected.has(product.id) ? "selected" : ""}>${escapeHtml(product.name)}（${escapeHtml(product.tags || "无标签")}）</option>`
+  )).join("");
 }
 
 function currentStaffName() {
@@ -186,9 +237,10 @@ function mountAdminView() {
   document.querySelector("#adminMount").innerHTML = `
     <section id="adminView">
       <header class="admin-header">
-        <div>
+        <div class="admin-header-copy">
+          <span class="section-kicker">摊位工作台</span>
           <h1>订单看板</h1>
-          <p id="adminSubtitle">新订单会响一声并高亮。</p>
+          <p id="adminSubtitle">今日订单</p>
         </div>
         <nav class="admin-tabs">
           <button class="active" data-tab="orders">订单</button>
@@ -201,6 +253,12 @@ function mountAdminView() {
 
       <main>
         <section id="ordersTab" class="tab-panel">
+          <div class="section-heading admin-section-heading">
+            <div>
+              <span class="section-kicker">现场处理</span>
+              <h2>今日订单</h2>
+            </div>
+          </div>
           <div class="board-actions">
             <button id="enableNotify" class="ghost-btn" type="button">开启系统通知</button>
             <button id="soundToggle" class="ghost-btn" type="button">声音：开</button>
@@ -216,6 +274,12 @@ function mountAdminView() {
         </section>
 
         <section id="productsTab" class="tab-panel" hidden>
+          <div class="section-heading admin-section-heading">
+            <div>
+              <span class="section-kicker">商品管理</span>
+              <h2>商品与库存</h2>
+            </div>
+          </div>
           <form id="productForm" class="editor-form">
             <input type="hidden" id="productId">
             <label>商品名<input id="productName" required></label>
@@ -229,10 +293,17 @@ function mountAdminView() {
             <button class="primary-btn" type="submit">保存商品</button>
             <button id="resetProduct" class="ghost-btn" type="button">清空表单</button>
           </form>
+          <div class="list-heading"><h2>商品列表</h2></div>
           <div id="productList" class="admin-list"></div>
         </section>
 
         <section id="settingsTab" class="tab-panel" hidden>
+          <div class="section-heading admin-section-heading">
+            <div>
+              <span class="section-kicker">摊位管理</span>
+              <h2>展示与收款</h2>
+            </div>
+          </div>
           <form id="settingsForm" class="editor-form settings-form">
             <label>摊位名<input id="settingBoothName"></label>
             <label>欢迎语<textarea id="settingWelcome" rows="3"></textarea></label>
@@ -256,6 +327,12 @@ function mountAdminView() {
         </section>
 
         <section id="salesTab" class="tab-panel" hidden>
+          <div class="section-heading admin-section-heading">
+            <div>
+              <span class="section-kicker">经营记录</span>
+              <h2>销售情况</h2>
+            </div>
+          </div>
           <div class="board-actions">
             <label class="date-filter">销售日期
               <input id="salesDateInput" type="date">
@@ -278,7 +355,50 @@ function mountAdminView() {
     </section>
   `;
   adminState.mounted = true;
+  enhanceAdminForms();
   bindAdminViewEvents();
+}
+
+function enhanceAdminForms() {
+  const stock = document.querySelector("#productStock");
+  if (stock && !document.querySelector("#productLowStock")) {
+    stock.closest("label").insertAdjacentHTML("afterend", `
+      <label>低库存提醒<input id="productLowStock" type="number" min="0" step="1" value="3"></label>
+    `);
+  }
+  const image = document.querySelector("#productImage");
+  if (image && !document.querySelector("#productGift")) {
+    image.closest("label").insertAdjacentHTML("afterend", `
+      <label class="check-row"><input id="productGift" type="checkbox"> 赠品/不可购买</label>
+    `);
+  }
+  const settingsForm = document.querySelector("#settingsForm");
+  if (settingsForm && !document.querySelector("#promotionEditor")) {
+    settingsForm.insertAdjacentHTML("afterend", `
+      <section id="promotionEditor" class="staff-manager promotion-manager">
+        <div>
+          <h2>促销规则</h2>
+          <p class="small-muted">赠品需要先在商品里添加，并勾选“赠品/不可购买”。每条规则满足后赠送一次。</p>
+        </div>
+        <div class="promo-block">
+          <h3>满额赠品</h3>
+          <div id="amountGiftRules" class="promo-list"></div>
+          <button class="ghost-btn" type="button" data-add-promo="amount_gifts">添加满额赠品</button>
+        </div>
+        <div class="promo-block">
+          <h3>买件赠品</h3>
+          <div id="quantityGiftRules" class="promo-list"></div>
+          <button class="ghost-btn" type="button" data-add-promo="quantity_gifts">添加买件赠品</button>
+        </div>
+        <div class="promo-block">
+          <h3>满额减价</h3>
+          <div id="amountDiscountRules" class="promo-list"></div>
+          <button class="ghost-btn" type="button" data-add-promo="amount_discounts">添加满额减价</button>
+        </div>
+        <button id="savePromotions" class="primary-btn" type="button">保存促销规则</button>
+      </section>
+    `);
+  }
 }
 
 async function login(event) {
@@ -318,6 +438,11 @@ function orderActionButtons(order) {
     actions.push(`<button class="primary-btn" data-claim-order="${order.id}">开始拣货</button>`);
   }
   if (order.order_status === "picking") {
+    if (!order.picker_name) {
+      actions.push(`<button class="primary-btn" data-claim-order="${order.id}">开始拣货</button>`);
+      actions.push(`<button class="ghost-btn" data-order-status="${order.id}:new">撤回新订单</button>`);
+      return actions.join("");
+    }
     if (isClaimedByOther(order)) {
       actions.push(`<button class="ghost-btn" data-transfer-order="${order.id}">转交给我</button>`);
     } else {
@@ -347,13 +472,17 @@ function orderItemsMarkup(order, interactive = false) {
   const canPick = interactive && order.order_status === "picking" && !isClaimedByOther(order);
   return `
     <div class="pick-list">
-      ${order.items.map((item) => `
-        <button class="pick-line ${item.picked ? "picked" : ""}" type="button" data-pick-item="${item.id}" data-picked="${item.picked ? "1" : "0"}" ${canPick ? "" : "disabled"}>
+      ${order.items.map((item) => {
+        const gift = isGiftItem(item);
+        const promotion = gift && item.promotion_name ? `<small>来自：${escapeHtml(item.promotion_name)}</small>` : "";
+        return `
+        <button class="pick-line ${item.picked ? "picked" : ""} ${gift ? "gift-line" : ""}" type="button" data-pick-item="${item.id}" data-picked="${item.picked ? "1" : "0"}" ${canPick ? "" : "disabled"}>
           <span class="pick-box">${item.picked ? "✓" : ""}</span>
-          <span class="pick-text">${escapeHtml(item.name)} × ${item.quantity}</span>
+          <span class="pick-text">${gift ? giftBadge() : ""}${escapeHtml(item.name)} × ${item.quantity}${promotion}</span>
           <span class="pick-price">${money(item.price)}</span>
         </button>
-      `).join("")}
+      `;
+      }).join("")}
     </div>
   `;
 }
@@ -407,8 +536,8 @@ function renderOrders() {
       ${pickerMeta(order)}
       ${order.pickup_time ? `<p class="order-meta">预计领取：${escapeHtml(order.pickup_time)}</p>` : ""}
       ${orderItemsMarkup(order, true)}
-      <p><strong>合计 ${money(order.total)}</strong></p>
-      ${order.note ? `<p class="order-meta">备注：${escapeHtml(order.note)}</p>` : ""}
+      ${priceSummaryMarkup(order, true)}
+      ${order.note ? `<p class="order-note"><strong>备注：</strong>${escapeHtml(order.note)}</p>` : ""}
       <div class="order-actions">
         ${orderActionButtons(order)}
       </div>
@@ -424,14 +553,16 @@ function renderOrders() {
 
 function renderProducts() {
   const list = document.querySelector("#productList");
-  list.innerHTML = adminState.products.map((product) => `
-    <article class="admin-product">
+  list.innerHTML = adminState.products.map((product) => {
+    const giftEmpty = product.is_gift && Number(product.stock || 0) <= 0;
+    return `
+    <article class="admin-product ${giftEmpty ? "gift-empty" : ""}">
       <div class="product-admin-row">
         <div>
-          <strong>${escapeHtml(product.name)}</strong>
+          <strong>${escapeHtml(product.name)}${product.is_gift ? giftBadge() : ""}${giftEmpty ? `<span class="stock-alert-badge">赠品已送完</span>` : ""}</strong>
           <div class="order-meta">${escapeHtml(product.category || "未分类")} · ${escapeHtml(product.author || "未填作者")}</div>
           <div class="order-meta">${escapeHtml(product.tags || "无标签")}</div>
-          <p>${money(product.price)} · 库存 ${product.stock} · ${product.active ? "上架" : "下架"}</p>
+          <p>${money(product.price)} · 库存 ${product.stock} · ${product.is_gift ? "不可购买" : (product.active ? "上架" : "下架")}</p>
         </div>
         ${product.image ? `<img src="${product.image}" alt="${escapeHtml(product.name)}">` : ""}
       </div>
@@ -440,7 +571,8 @@ function renderProducts() {
         <button class="ghost-btn" data-delete-product="${product.id}">删除</button>
       </div>
     </article>
-  `).join("") || `<p class="small-muted">还没有商品</p>`;
+  `;
+  }).join("") || `<p class="small-muted">还没有商品</p>`;
 }
 
 function renderSales() {
@@ -453,7 +585,7 @@ function renderSales() {
     <article class="admin-product">
       <div class="product-admin-row">
         <div>
-          <strong>${escapeHtml(product.name)}</strong>
+          <strong>${escapeHtml(product.name)}${isGiftItem(product) ? giftBadge() : ""}</strong>
           <div class="order-meta">${escapeHtml(product.category || "未分类")} · ${escapeHtml(product.author || "未填作者")}</div>
           <p>${money(product.price)} · 售出 ${product.sold_quantity} 件 · <strong>${money(product.sales_total)}</strong></p>
         </div>
@@ -472,7 +604,7 @@ function renderSales() {
       </div>
       <p class="order-meta">${receiveText[order.receive_type]} · ${methodText[order.payment_method]} · ${order.receive_type === "later" ? `电话 ${escapeHtml(order.phone || "未填")}` : `尾号 ${escapeHtml(order.phone_tail || "未填")}`}</p>
       ${order.pickup_time ? `<p class="order-meta">预计领取：${escapeHtml(order.pickup_time)}</p>` : ""}
-      <ol class="order-items">${order.items.map((item) => `<li>${escapeHtml(item.name)} × ${item.quantity}：${money(item.price)}</li>`).join("")}</ol>
+      <ol class="order-items">${order.items.map((item) => `<li>${orderItemLine(item)}</li>`).join("")}</ol>
     </article>
   `).join("") || `<p class="small-muted">这个范围内还没有订单</p>`;
 }
@@ -482,9 +614,11 @@ function fillProductForm(product) {
   document.querySelector("#productName").value = product?.name || "";
   document.querySelector("#productPrice").value = product?.price || "";
   document.querySelector("#productStock").value = product?.stock ?? "";
+  if (document.querySelector("#productLowStock")) document.querySelector("#productLowStock").value = product?.low_stock_threshold ?? 3;
   document.querySelector("#productCategory").value = product?.category || "";
   document.querySelector("#productAuthor").value = product?.author || "";
   document.querySelector("#productTags").value = product?.tags || "";
+  if (document.querySelector("#productGift")) document.querySelector("#productGift").checked = Boolean(product?.is_gift);
   document.querySelector("#productActive").checked = product?.active ?? true;
   document.querySelector("#productImage").value = "";
   adminState.editingImage = product?.image || "";
@@ -505,6 +639,192 @@ function renderStaffManager() {
   `).join("") || `<p class="small-muted">还没有配置摊员。未配置时，登录页会允许直接用“摊主”进入。</p>`;
 }
 
+function isGiftItem(item) {
+  return item?.item_type === "gift" || item?.is_gift;
+}
+
+function giftBadge() {
+  return `<span class="gift-badge">赠品</span>`;
+}
+
+function promoGiftOptions(selectedId = 0) {
+  const gifts = adminState.products.filter((product) => product.is_gift);
+  if (!gifts.length) return `<option value="">先添加赠品商品</option>`;
+  return [`<option value="">选择赠品</option>`, ...gifts.map((product) => (
+    `<option value="${product.id}" ${Number(selectedId) === product.id ? "selected" : ""}>${escapeHtml(product.name)}（库存 ${product.stock}${Number(product.stock || 0) <= 0 ? "，已送完" : ""}）</option>`
+  ))].join("");
+}
+
+function promoProductPicker(selectedIds = []) {
+  const selected = new Set((selectedIds || []).map(Number));
+  const products = adminState.products.filter((product) => !product.is_gift);
+  if (!products.length) return `<p class="small-muted">还没有可售商品</p>`;
+  return `
+    <div class="promo-product-picker">
+      ${products.map((product) => {
+        const meta = [product.category, product.author, product.tags].filter(Boolean).join(" · ");
+        return `
+          <label class="promo-product-option">
+            <input type="checkbox" data-promo-product value="${product.id}" ${selected.has(product.id) ? "checked" : ""}>
+            <span>
+              <strong>${escapeHtml(product.name)}</strong>
+              ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
+            </span>
+          </label>
+        `;
+      }).join("")}
+    </div>
+  `;
+}
+
+function promotionTriggerType(rule) {
+  return ["all", "tag", "products"].includes(rule?.trigger_type) ? rule.trigger_type : "all";
+}
+
+function syncPromotionRowVisibility(row) {
+  if (!row) return;
+  const triggerType = row.querySelector('[data-promo-field="trigger_type"]')?.value || "all";
+  row.classList.remove("trigger-all", "trigger-tag", "trigger-products");
+  row.classList.add(`trigger-${triggerType}`);
+}
+
+function priceSummaryMarkup(order, compact = false) {
+  const subtotal = Number(order.subtotal || order.total || 0);
+  const discount = Number(order.discount_total || 0);
+  const total = Number(order.total || 0);
+  if (discount <= 0) {
+    return `<p class="${compact ? "order-total-line compact" : "order-total-line"}"><strong>合计 ${money(total)}</strong></p>`;
+  }
+  return `
+    <div class="${compact ? "price-breakdown compact" : "price-breakdown"}">
+      <div><span>原价</span><strong>${money(subtotal)}</strong></div>
+      <div class="discount"><span>满减</span><strong>- ${money(discount)}</strong></div>
+      <div class="final"><span>优惠后</span><strong>${money(total)}</strong></div>
+    </div>
+  `;
+}
+
+function orderItemLine(item) {
+  const gift = isGiftItem(item);
+  const promotion = gift && item.promotion_name ? ` <span class="item-promo">来自：${escapeHtml(item.promotion_name)}</span>` : "";
+  return `${gift ? giftBadge() : ""}${escapeHtml(item.name)} × ${item.quantity}：${money(item.price)}${promotion}`;
+}
+
+function renderPromotions() {
+  if (!document.querySelector("#promotionEditor")) return;
+  const data = promotions();
+  document.querySelector("#amountGiftRules").innerHTML = data.amount_gifts.map((rule, index) => `
+    <div class="promo-row" data-promo-row="amount_gifts:${index}">
+      <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="规则名">
+      <input data-promo-field="threshold" type="number" min="0" step="0.01" value="${rule.threshold || ""}" placeholder="满额">
+      <select data-promo-field="gift_product_id">${giftOptions(rule.gift_product_id)}</select>
+      <input data-promo-field="gift_quantity" type="number" min="1" step="1" value="${rule.gift_quantity || 1}" placeholder="数量">
+      <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
+      <button class="ghost-btn" type="button" data-remove-promo="amount_gifts:${index}">删除</button>
+    </div>
+  `).join("") || `<p class="small-muted">还没有满额赠品规则</p>`;
+  document.querySelector("#quantityGiftRules").innerHTML = data.quantity_gifts.map((rule, index) => `
+    <div class="promo-row" data-promo-row="quantity_gifts:${index}">
+      <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="规则名">
+      <input data-promo-field="buy_quantity" type="number" min="1" step="1" value="${rule.buy_quantity || ""}" placeholder="买满件数">
+      <select data-promo-field="gift_product_id">${giftOptions(rule.gift_product_id)}</select>
+      <input data-promo-field="gift_quantity" type="number" min="1" step="1" value="${rule.gift_quantity || 1}" placeholder="数量">
+      <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
+      <button class="ghost-btn" type="button" data-remove-promo="quantity_gifts:${index}">删除</button>
+    </div>
+  `).join("") || `<p class="small-muted">还没有买件赠品规则</p>`;
+  document.querySelector("#amountDiscountRules").innerHTML = data.amount_discounts.map((rule, index) => `
+    <div class="promo-row" data-promo-row="amount_discounts:${index}">
+      <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="规则名">
+      <input data-promo-field="threshold" type="number" min="0" step="0.01" value="${rule.threshold || ""}" placeholder="满额">
+      <input data-promo-field="discount" type="number" min="0" step="0.01" value="${rule.discount || ""}" placeholder="减价">
+      <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
+      <button class="ghost-btn" type="button" data-remove-promo="amount_discounts:${index}">删除</button>
+    </div>
+  `).join("") || `<p class="small-muted">还没有满额减价规则</p>`;
+}
+
+function renderPromotions() {
+  if (!document.querySelector("#promotionEditor")) return;
+  const data = promotions();
+  document.querySelector("#amountGiftRules").innerHTML = data.amount_gifts.map((rule, index) => `
+    <div class="promo-row promo-rule" data-promo-row="amount_gifts:${index}">
+      <div class="promo-rule-title"><strong>满额赠品</strong><span>第 ${index + 1} 条</span></div>
+      <label class="promo-field">规则名
+        <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="例如 满 100 送明信片">
+      </label>
+      <label class="promo-field">订单满额
+        <input data-promo-field="threshold" type="number" min="0" step="0.01" value="${rule.threshold || ""}" placeholder="满多少元">
+      </label>
+      <label class="promo-field">赠品
+        <select data-promo-field="gift_product_id">${promoGiftOptions(rule.gift_product_id)}</select>
+      </label>
+      <label class="promo-field">赠送数量
+        <input data-promo-field="gift_quantity" type="number" min="1" step="1" value="${rule.gift_quantity || 1}">
+      </label>
+      <div class="promo-rule-actions">
+        <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
+        <button class="ghost-btn" type="button" data-remove-promo="amount_gifts:${index}">删除</button>
+      </div>
+    </div>
+  `).join("") || `<p class="small-muted">还没有满额赠品规则</p>`;
+
+  document.querySelector("#quantityGiftRules").innerHTML = data.quantity_gifts.map((rule, index) => `
+    <div class="promo-row promo-rule promo-quantity-rule trigger-${promotionTriggerType(rule)}" data-promo-row="quantity_gifts:${index}">
+      <div class="promo-rule-title"><strong>买件赠品</strong><span>第 ${index + 1} 条</span></div>
+      <label class="promo-field">规则名
+        <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="例如 买吧唧送小卡">
+      </label>
+      <label class="promo-field">买哪些商品
+        <select data-promo-field="trigger_type">
+        <option value="all" ${(rule.trigger_type || "all") === "all" ? "selected" : ""}>全部商品</option>
+        <option value="tag" ${rule.trigger_type === "tag" ? "selected" : ""}>指定标签</option>
+        <option value="products" ${rule.trigger_type === "products" ? "selected" : ""}>指定商品</option>
+        </select>
+      </label>
+      <label class="promo-field promo-tag-field">触发标签
+        <input data-promo-field="trigger_tag" value="${escapeHtml(rule.trigger_tag || "")}" placeholder="和商品标签完全一致">
+      </label>
+      <div class="promo-field promo-products-field">
+        <span>指定商品</span>
+        ${promoProductPicker(rule.trigger_product_ids)}
+      </div>
+      <label class="promo-field">买满件数
+        <input data-promo-field="buy_quantity" type="number" min="1" step="1" value="${rule.buy_quantity || 1}">
+      </label>
+      <label class="promo-field">赠品
+        <select data-promo-field="gift_product_id">${promoGiftOptions(rule.gift_product_id)}</select>
+      </label>
+      <label class="promo-field">赠送数量
+        <input data-promo-field="gift_quantity" type="number" min="1" step="1" value="${rule.gift_quantity || 1}">
+      </label>
+      <div class="promo-rule-actions">
+        <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
+        <button class="ghost-btn" type="button" data-remove-promo="quantity_gifts:${index}">删除</button>
+      </div>
+    </div>
+  `).join("") || `<p class="small-muted">还没有买件赠品规则</p>`;
+
+  document.querySelector("#amountDiscountRules").innerHTML = data.amount_discounts.map((rule, index) => `
+    <div class="promo-row promo-rule" data-promo-row="amount_discounts:${index}">
+      <div class="promo-rule-title"><strong>满额减价</strong><span>第 ${index + 1} 条</span></div>
+      <label class="promo-field">规则名
+        <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="例如 满 100 减 10">
+      </label>
+      <label class="promo-field">订单满额
+        <input data-promo-field="threshold" type="number" min="0" step="0.01" value="${rule.threshold || ""}" placeholder="满多少元">
+      </label>
+      <label class="promo-field">减价金额
+        <input data-promo-field="discount" type="number" min="0" step="0.01" value="${rule.discount || ""}" placeholder="减多少元">
+      </label>
+      <div class="promo-rule-actions">
+        <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
+        <button class="ghost-btn" type="button" data-remove-promo="amount_discounts:${index}">删除</button>
+      </div>
+    </div>
+  `).join("") || `<p class="small-muted">还没有满额减价规则</p>`;
+}
+
 function renderSettings(force = false) {
   if (adminState.settingsDirty && !force) return;
   document.querySelector("#settingBoothName").value = adminState.settings.booth_name || "";
@@ -515,6 +835,7 @@ function renderSettings(force = false) {
     alipay_qr: adminState.settings.alipay_qr || "",
   };
   renderStaffManager();
+  if (!adminState.promotionsDirty || force) renderPromotions();
 }
 
 async function loadAll(playNotice = true) {
@@ -555,10 +876,12 @@ async function saveProduct(event) {
       name: document.querySelector("#productName").value,
       price: Number(document.querySelector("#productPrice").value),
       stock: Number(document.querySelector("#productStock").value),
+      low_stock_threshold: Number(document.querySelector("#productLowStock")?.value || 3),
       category: document.querySelector("#productCategory").value,
       author: document.querySelector("#productAuthor").value,
       tags: document.querySelector("#productTags").value,
       image,
+      is_gift: Boolean(document.querySelector("#productGift")?.checked),
       active: document.querySelector("#productActive").checked,
     };
     const id = document.querySelector("#productId").value;
@@ -623,6 +946,72 @@ async function saveStaffMembers(members) {
   await loadLoginStaffChoices();
 }
 
+function collectPromotions() {
+  const data = { amount_gifts: [], quantity_gifts: [], amount_discounts: [] };
+  document.querySelectorAll("[data-promo-row]").forEach((row) => {
+    const [type] = row.dataset.promoRow.split(":");
+    const rule = {};
+    row.querySelectorAll("[data-promo-field]").forEach((field) => {
+      const key = field.dataset.promoField;
+      if (field.multiple) rule[key] = Array.from(field.selectedOptions).map((option) => Number(option.value)).filter(Boolean);
+      else if (field.type === "checkbox") rule[key] = field.checked;
+      else if (["threshold", "discount"].includes(key)) rule[key] = Number(field.value || 0);
+      else if (["gift_product_id", "gift_quantity", "buy_quantity"].includes(key)) rule[key] = Number(field.value || 0);
+      else rule[key] = field.value.trim();
+    });
+    const productChecks = row.querySelectorAll("[data-promo-product]");
+    if (productChecks.length) {
+      rule.trigger_product_ids = Array.from(productChecks)
+        .filter((field) => field.checked)
+        .map((field) => Number(field.value))
+        .filter(Boolean);
+    }
+    data[type].push(rule);
+  });
+  return data;
+}
+
+function currentPromotionDraft() {
+  return document.querySelector("[data-promo-row]") ? collectPromotions() : promotions();
+}
+
+async function savePromotions() {
+  const next = collectPromotions();
+  const settings = await api("/api/admin/settings", {
+    method: "POST",
+    body: JSON.stringify({ promotions: JSON.stringify(next) }),
+  });
+  adminState.settings = settings;
+  adminState.promotionsDirty = false;
+  renderPromotions();
+  showAdminToast("促销规则已保存");
+}
+
+function addPromotion(type) {
+  const data = currentPromotionDraft();
+  if (type === "amount_gifts") {
+    data.amount_gifts.push({ name: "满额赠品", threshold: 0, gift_product_id: 0, gift_quantity: 1, active: true });
+  }
+  if (type === "quantity_gifts") {
+    data.quantity_gifts.push({ name: "买件赠品", trigger_type: "all", trigger_tag: "", trigger_product_ids: [], buy_quantity: 1, gift_product_id: 0, gift_quantity: 1, active: true });
+  }
+  if (type === "amount_discounts") {
+    data.amount_discounts.push({ name: "满额减价", threshold: 0, discount: 0, active: true });
+  }
+  adminState.settings.promotions = JSON.stringify(data);
+  adminState.promotionsDirty = true;
+  renderPromotions();
+}
+
+function removePromotion(value) {
+  const [type, indexText] = value.split(":");
+  const data = currentPromotionDraft();
+  data[type].splice(Number(indexText), 1);
+  adminState.settings.promotions = JSON.stringify(data);
+  adminState.promotionsDirty = true;
+  renderPromotions();
+}
+
 async function updateOrder(id, field, value, extra = {}) {
   const payload = field === "status" ? { order_status: value } : { payment_status: value };
   Object.assign(payload, extra);
@@ -669,6 +1058,15 @@ async function togglePicked(itemId, picked) {
 
 document.querySelector("#loginForm").addEventListener("submit", login);
 document.addEventListener("pointerdown", unlockAudio, { once: true });
+document.addEventListener("input", (event) => {
+  if (event.target.closest("#promotionEditor")) adminState.promotionsDirty = true;
+});
+document.addEventListener("change", (event) => {
+  if (event.target.closest("#promotionEditor")) adminState.promotionsDirty = true;
+  if (event.target.matches('[data-promo-field="trigger_type"]')) {
+    syncPromotionRowVisibility(event.target.closest("[data-promo-row]"));
+  }
+});
 
 function bindAdminViewEvents() {
   document.querySelector("#productForm").addEventListener("submit", saveProduct);
@@ -750,6 +1148,9 @@ document.addEventListener("click", async (event) => {
   const del = event.target.closest("[data-delete-product]");
   const renameStaff = event.target.closest("[data-rename-staff]");
   const deleteStaff = event.target.closest("[data-delete-staff]");
+  const addPromo = event.target.closest("[data-add-promo]");
+  const removePromo = event.target.closest("[data-remove-promo]");
+  const savePromo = event.target.closest("#savePromotions");
   try {
     if (claim) await claimOrder(claim.dataset.claimOrder);
     if (transfer) await transferOrder(transfer.dataset.transferOrder);
@@ -800,6 +1201,20 @@ document.addEventListener("click", async (event) => {
       await saveStaffMembers(members);
       showAdminToast("摊员已删除");
     }
+  } catch (error) {
+    alert(error.message);
+  }
+});
+
+document.addEventListener("click", async (event) => {
+  const addPromo = event.target.closest("[data-add-promo]");
+  const removePromo = event.target.closest("[data-remove-promo]");
+  const savePromo = event.target.closest("#savePromotions");
+  if (!addPromo && !removePromo && !savePromo) return;
+  try {
+    if (addPromo) addPromotion(addPromo.dataset.addPromo);
+    if (removePromo) removePromotion(removePromo.dataset.removePromo);
+    if (savePromo) await savePromotions();
   } catch (error) {
     alert(error.message);
   }
