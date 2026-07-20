@@ -5,6 +5,8 @@ const state = {
   receiveType: "now",
   paymentMethod: "wechat",
   toastTimer: null,
+  pendingOrderToken: "",
+  submitting: false,
 };
 
 const money = (value) => `¥${Number(value || 0).toFixed(2)}`;
@@ -20,18 +22,57 @@ function escapeHtml(value) {
   }[char]));
 }
 
-async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || "操作失败");
+async function api(path, options = {}, attempt = 0) {
+  const { retrySafe = false, ...fetchOptions } = options;
+  const method = String(fetchOptions.method || "GET").toUpperCase();
+  const canRetry = method === "GET" || retrySafe;
+  let res;
+  try {
+    res = await fetch(path, {
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", ...(fetchOptions.headers || {}) },
+      ...fetchOptions,
+    });
+  } catch (error) {
+    if (canRetry && attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+      return api(path, options, attempt + 1);
+    }
+    throw new Error("网络连接不稳定，请稍后重试");
+  }
+  const raw = await res.text();
+  let data = {};
+  if (raw.trim()) {
+    try {
+      data = JSON.parse(raw);
+    } catch (error) {
+      if (canRetry && attempt < 2 && (res.ok || res.status >= 500)) {
+        await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+        return api(path, options, attempt + 1);
+      }
+      throw new Error("服务器返回内容不完整，请稍后重试");
+    }
+  } else if (res.ok && canRetry && attempt < 2) {
+    await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+    return api(path, options, attempt + 1);
+  } else if (res.ok) {
+    throw new Error("服务器没有返回内容，请稍后重试");
+  }
+  if (!res.ok && canRetry && attempt < 2 && (res.status === 429 || res.status >= 500)) {
+    await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    return api(path, options, attempt + 1);
+  }
+  if (!res.ok) throw new Error(data.error || (res.status >= 500 ? "服务器暂时繁忙，请稍后重试" : "操作失败"));
   return data;
 }
 
+function newOrderToken() {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
 function productImage(product) {
-  if (product.image) return `<img class="product-image" src="${product.image}" alt="${escapeHtml(product.name)}">`;
+  if (product.image) return `<img class="product-image" src="${product.image}" alt="${escapeHtml(product.name)}" loading="lazy" decoding="async">`;
   return `<div class="product-image product-placeholder">暂无图片</div>`;
 }
 
@@ -283,6 +324,7 @@ function renderOrder(order) {
 
 async function submitOrder(event) {
   event.preventDefault();
+  if (state.submitting) return;
   const phone = digitsOnly(document.querySelector("#phoneInput").value);
   const phoneTail = digitsOnly(document.querySelector("#phoneTailInput").value);
   if (state.receiveType === "later" && phone.length !== 11) {
@@ -301,10 +343,17 @@ async function submitOrder(event) {
     product_id: line.product.id,
     quantity: line.quantity,
   }));
+  const submitButton = document.querySelector("#submitOrder");
+  state.pendingOrderToken ||= newOrderToken();
+  state.submitting = true;
+  submitButton.disabled = true;
+  submitButton.textContent = "正在生成取单码...";
   try {
     const order = await api("/api/orders", {
       method: "POST",
+      retrySafe: true,
       body: JSON.stringify({
+        client_token: state.pendingOrderToken,
         items,
         receive_type: state.receiveType,
         phone: state.receiveType === "later" ? phone : "",
@@ -314,20 +363,23 @@ async function submitOrder(event) {
         note: document.querySelector("#noteInput").value,
       }),
     });
+    state.pendingOrderToken = "";
     state.cart.clear();
-    await load();
     renderCart();
     renderOrder(order);
+    load().catch(() => showToast("订单已生成，商品库存稍后刷新"));
   } catch (error) {
     alert(error.message);
+  } finally {
+    state.submitting = false;
+    submitButton.textContent = "结算并生成取单码";
+    submitButton.disabled = state.cart.size === 0;
   }
 }
 
 async function load() {
-  const [settings, products] = await Promise.all([
-    api("/api/settings"),
-    api("/api/products"),
-  ]);
+  const settings = await api("/api/settings");
+  const products = await api("/api/products");
   state.settings = settings;
   state.products = products;
   renderBooth();
@@ -389,4 +441,4 @@ if ("IntersectionObserver" in window) {
 }
 
 setupPickupTimes();
-load().catch((error) => alert(error.message));
+load().catch((error) => alert(error.message || "页面加载失败，请刷新后重试"));
