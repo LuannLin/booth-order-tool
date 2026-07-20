@@ -1001,8 +1001,8 @@ class BoothHandler(BaseHTTPRequestHandler):
                 (*fields, stamp, stamp),
             )
             conn.commit()
-            product = conn.execute("SELECT * FROM products WHERE id = ?", (cur.lastrowid,)).fetchone()
-        write_json(self, 201, row_to_product(product))
+            product_id = cur.lastrowid
+        write_json(self, 201, {"ok": True, "id": product_id})
 
     def update_product(self, product_id: int) -> None:
         payload = read_body(self)
@@ -1018,10 +1018,10 @@ class BoothHandler(BaseHTTPRequestHandler):
                 (*fields, stamp, product_id),
             )
             conn.commit()
-            product = conn.execute("SELECT * FROM products WHERE id = ?", (product_id,)).fetchone()
+            product = conn.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone()
         if not product:
             return write_json(self, 404, {"error": "商品不存在"})
-        write_json(self, 200, row_to_product(product))
+        write_json(self, 200, {"ok": True, "id": product_id})
 
     def update_order(self, order_id: int) -> None:
         payload = read_body(self)
@@ -1115,8 +1115,7 @@ class BoothHandler(BaseHTTPRequestHandler):
                         (key, str(value)),
                     )
             conn.commit()
-            data = settings_dict(conn, public=False)
-        write_json(self, 200, data)
+        write_json(self, 200, {"ok": True})
 
     def export_csv(self) -> None:
         with DB_LOCK, connect() as conn:
