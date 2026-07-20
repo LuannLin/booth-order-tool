@@ -1,1511 +1,1389 @@
-const adminState = {
-  products: [],
-  orders: [],
-  settings: {},
-  lastOrderId: 0,
-  soundOn: true,
-  editingImage: "",
-  settingImages: {},
-  mounted: false,
-  settingsDirty: false,
-  promotionsDirty: false,
-  audioContext: null,
-  orderDate: "",
-  salesDate: localDateString(),
-  sales: null,
-  productSearch: "",
-  productFilter: "all",
-  productAuthorFilter: "",
-  selectedProductIds: new Set(),
-  staffName: localStorage.getItem("booth_staff_name") || "",
-};
+from __future__ import annotations
 
-const money = (value) => `¥${Number(value || 0).toFixed(2)}`;
-const statusText = { new: "新订单", picking: "拣货中", ready: "待取单", completed: "已取单", cancelled: "已取消" };
-const payText = { pending: "待核验", verified: "已核验", cash_pending: "现金待收", cash_received: "现金已收" };
-const methodText = { wechat: "微信", alipay: "支付宝", cash: "现金" };
-const receiveText = { now: "现在领取", later: "稍后领取" };
+import base64
+import binascii
+import csv
+import hashlib
+import json
+import os
+import secrets
+import sqlite3
+import threading
+import time
+from datetime import datetime
+from http import cookies
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, unquote_to_bytes, urlparse
 
-function localDateString(date = new Date()) {
-  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
-  return local.toISOString().slice(0, 10);
+
+BASE_DIR = Path(__file__).resolve().parent
+PUBLIC_DIR = BASE_DIR / "public"
+DATA_DIR = Path(os.environ.get("BOOTH_DATA_DIR", BASE_DIR / "data"))
+DB_PATH = DATA_DIR / "booth.sqlite3"
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8765"))
+ADMIN_PATH = os.environ.get("ADMIN_PATH", "/admin")
+if not ADMIN_PATH.startswith("/"):
+    ADMIN_PATH = "/" + ADMIN_PATH
+
+JSON_HEADERS = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
 }
+ADMIN_COOKIE = "booth_admin"
+SESSIONS: set[str] = set()
+DB_LOCK = threading.Lock()
+PRODUCT_MEDIA_PREFIX = "/api/media/products/"
+SETTING_MEDIA_PREFIX = "/api/media/settings/"
+MEDIA_SETTING_KEYS = {"logo", "wechat_qr", "alipay_qr"}
 
-function escapeHtml(value = "") {
-  return String(value).replace(/[&<>"']/g, (char) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    "\"": "&quot;",
-    "'": "&#39;",
-  }[char]));
-}
 
-function splitTags(value = "") {
-  return String(value)
-    .split(/[,，、]/)
-    .map((tag) => tag.trim())
-    .filter(Boolean);
-}
+def now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-function uniqueSorted(values) {
-  return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))]
-    .sort((a, b) => a.localeCompare(b, "zh-CN"));
-}
 
-async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
-  const raw = await res.text();
-  const isMutation = Boolean(options.method && options.method !== "GET");
-  let data = {};
-  if (raw.trim()) {
-    try {
-      data = JSON.parse(raw);
-    } catch (error) {
-      if (!(res.ok && isMutation)) throw new Error("服务器返回内容不完整，请刷新后重试");
-    }
-  } else if (!(res.ok && isMutation)) {
-    throw new Error("服务器没有返回内容，请刷新后重试");
-  }
-  if (!res.ok) {
-    const error = new Error(data.error || "操作失败");
-    error.status = res.status;
-    error.data = data;
-    throw error;
-  }
-  return data;
-}
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
-function staffMembers() {
-  try {
-    const members = JSON.parse(adminState.settings.staff_members || "[]");
-    return Array.isArray(members) ? members.filter(Boolean) : [];
-  } catch (error) {
-    return [];
-  }
-}
 
-function promotions() {
-  try {
-    const data = JSON.parse(adminState.settings.promotions || "{}");
+def init_db() -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    with DB_LOCK, connect() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                price REAL NOT NULL DEFAULT 0,
+                stock INTEGER NOT NULL DEFAULT 0,
+                category TEXT NOT NULL DEFAULT '',
+                author TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '',
+                image TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                is_gift INTEGER NOT NULL DEFAULT 0,
+                low_stock_threshold INTEGER NOT NULL DEFAULT 3,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pickup_code TEXT NOT NULL UNIQUE,
+                client_token TEXT NOT NULL DEFAULT '',
+                receive_type TEXT NOT NULL,
+                phone TEXT NOT NULL DEFAULT '',
+                phone_tail TEXT NOT NULL DEFAULT '',
+                pickup_time TEXT NOT NULL DEFAULT '',
+                payment_method TEXT NOT NULL,
+                payment_status TEXT NOT NULL DEFAULT 'pending',
+                order_status TEXT NOT NULL DEFAULT 'new',
+                subtotal REAL NOT NULL DEFAULT 0,
+                discount_total REAL NOT NULL DEFAULT 0,
+                total REAL NOT NULL DEFAULT 0,
+                note TEXT NOT NULL DEFAULT '',
+                picker_name TEXT NOT NULL DEFAULT '',
+                picker_at TEXT NOT NULL DEFAULT '',
+                ready_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS order_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER NOT NULL,
+                product_id INTEGER,
+                name TEXT NOT NULL,
+                price REAL NOT NULL,
+                quantity INTEGER NOT NULL,
+                picked INTEGER NOT NULL DEFAULT 0,
+                item_type TEXT NOT NULL DEFAULT 'sale',
+                promotion_name TEXT NOT NULL DEFAULT '',
+                author TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
+                tags TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(order_id) REFERENCES orders(id)
+            );
+            """
+        )
+        defaults = {
+            "booth_name": "星河临时摊",
+            "welcome": "欢迎光临，选好后拿取单码来摊位核验付款取货。",
+            "logo": "",
+            "wechat_qr": "",
+            "alipay_qr": "",
+            "admin_password": "123456",
+            "staff_members": "[]",
+            "promotions": '{"amount_gifts":[],"quantity_gifts":[],"amount_discounts":[]}',
+        }
+        for key, value in defaults.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+                (key, value),
+            )
+        order_columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
+        if "phone_tail" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN phone_tail TEXT NOT NULL DEFAULT ''")
+        if "pickup_time" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN pickup_time TEXT NOT NULL DEFAULT ''")
+        if "ready_at" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN ready_at TEXT NOT NULL DEFAULT ''")
+        if "picker_name" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN picker_name TEXT NOT NULL DEFAULT ''")
+        if "picker_at" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN picker_at TEXT NOT NULL DEFAULT ''")
+        item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(order_items)").fetchall()}
+        if "picked" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN picked INTEGER NOT NULL DEFAULT 0")
+        if "item_type" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN item_type TEXT NOT NULL DEFAULT 'sale'")
+        if "promotion_name" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN promotion_name TEXT NOT NULL DEFAULT ''")
+        if "author" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN author TEXT NOT NULL DEFAULT ''")
+        if "category" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+        if "tags" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
+        product_columns = {row["name"] for row in conn.execute("PRAGMA table_info(products)").fetchall()}
+        if "category" not in product_columns:
+            conn.execute("ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+        if "author" not in product_columns:
+            conn.execute("ALTER TABLE products ADD COLUMN author TEXT NOT NULL DEFAULT ''")
+        if "tags" not in product_columns:
+            conn.execute("ALTER TABLE products ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
+        if "is_gift" not in product_columns:
+            conn.execute("ALTER TABLE products ADD COLUMN is_gift INTEGER NOT NULL DEFAULT 0")
+        if "low_stock_threshold" not in product_columns:
+            conn.execute("ALTER TABLE products ADD COLUMN low_stock_threshold INTEGER NOT NULL DEFAULT 3")
+        order_columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
+        if "subtotal" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN subtotal REAL NOT NULL DEFAULT 0")
+            conn.execute("UPDATE orders SET subtotal = total WHERE subtotal = 0")
+        if "discount_total" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN discount_total REAL NOT NULL DEFAULT 0")
+        if "client_token" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN client_token TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_client_token "
+            "ON orders(client_token) WHERE client_token <> ''"
+        )
+        existing = conn.execute("SELECT COUNT(*) AS c FROM products").fetchone()["c"]
+        if existing == 0:
+            sample_time = now_text()
+            samples = [
+                ("流星徽章", 15, 12, "徽章", "主催", "闪亮,示例", ""),
+                ("月光贴纸包", 20, 8, "贴纸", "合摊A", "套组,示例", ""),
+                ("云朵小卡", 10, 0, "纸品", "合摊B", "售罄示例", ""),
+            ]
+            conn.executemany(
+                """
+                INSERT INTO products(name, price, stock, category, author, tags, image, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [(*row, sample_time, sample_time) for row in samples],
+            )
+        conn.commit()
+
+
+def read_body(handler: BaseHTTPRequestHandler) -> dict:
+    length = int(handler.headers.get("Content-Length", "0"))
+    if length <= 0:
+        return {}
+    raw = handler.rfile.read(length)
+    return json.loads(raw.decode("utf-8"))
+
+
+def write_json(handler: BaseHTTPRequestHandler, status: int, payload: dict | list) -> None:
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    for key, value in JSON_HEADERS.items():
+        handler.send_header(key, value)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def write_text(handler: BaseHTTPRequestHandler, status: int, text: str, content_type: str) -> None:
+    data = text.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+def media_version(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def product_media_url(product_id: int, value: str) -> str:
+    if not value:
+        return ""
+    return f"{PRODUCT_MEDIA_PREFIX}{product_id}?v={media_version(value)}"
+
+
+def setting_media_url(key: str, value: str) -> str:
+    if not value:
+        return ""
+    return f"{SETTING_MEDIA_PREFIX}{key}?v={media_version(value)}"
+
+
+def settings_dict(conn: sqlite3.Connection, public: bool = True, media_urls: bool = False) -> dict:
+    rows = conn.execute("SELECT key, value FROM settings").fetchall()
+    result = {row["key"]: row["value"] for row in rows}
+    if public:
+        result.pop("admin_password", None)
+        result.pop("staff_members", None)
+    if media_urls:
+        for key in MEDIA_SETTING_KEYS:
+            result[key] = setting_media_url(key, result.get(key, ""))
+    return result
+
+
+def staff_members_from_settings(settings: dict) -> list[str]:
+    raw = settings.get("staff_members", "[]")
+    try:
+        members = json.loads(raw) if isinstance(raw, str) else raw
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(members, list):
+        return []
+    clean: list[str] = []
+    seen = set()
+    for member in members:
+        name = str(member).strip()[:30]
+        if name and name not in seen:
+            clean.append(name)
+            seen.add(name)
+    return clean
+
+
+def clean_promotions(raw_value) -> dict:
+    if isinstance(raw_value, str):
+        try:
+            raw = json.loads(raw_value or "{}")
+        except json.JSONDecodeError:
+            raw = {}
+    elif isinstance(raw_value, dict):
+        raw = raw_value
+    else:
+        raw = {}
+
+    def money_value(value) -> float:
+        return max(0.0, round(float(value or 0), 2))
+
+    def int_value(value) -> int:
+        return max(0, int(value or 0))
+
+    amount_gifts = []
+    for item in raw.get("amount_gifts", []):
+        try:
+            rule = {
+                "name": str(item.get("name") or "满额赠品").strip()[:40],
+                "threshold": money_value(item.get("threshold")),
+                "gift_product_id": int_value(item.get("gift_product_id")),
+                "gift_quantity": max(1, int_value(item.get("gift_quantity"))),
+                "active": bool(item.get("active", True)),
+            }
+        except (TypeError, ValueError):
+            continue
+        if rule["threshold"] > 0 and rule["gift_product_id"] > 0:
+            amount_gifts.append(rule)
+
+    quantity_gifts = []
+    for item in raw.get("quantity_gifts", []):
+        try:
+            trigger_type = str(item.get("trigger_type") or "all").strip()
+            if trigger_type not in {"all", "tag", "products"}:
+                trigger_type = "all"
+            product_ids = item.get("trigger_product_ids") or []
+            if not isinstance(product_ids, list):
+                product_ids = []
+            rule = {
+                "name": str(item.get("name") or "买件赠品").strip()[:40],
+                "trigger_type": trigger_type,
+                "trigger_tag": str(item.get("trigger_tag") or "").strip()[:40],
+                "trigger_product_ids": [int_value(value) for value in product_ids if int_value(value) > 0],
+                "buy_quantity": max(1, int_value(item.get("buy_quantity"))),
+                "gift_product_id": int_value(item.get("gift_product_id")),
+                "gift_quantity": max(1, int_value(item.get("gift_quantity"))),
+                "active": bool(item.get("active", True)),
+            }
+        except (TypeError, ValueError):
+            continue
+        if rule["gift_product_id"] > 0:
+            quantity_gifts.append(rule)
+
+    amount_discounts = []
+    for item in raw.get("amount_discounts", []):
+        try:
+            rule = {
+                "name": str(item.get("name") or "满额减价").strip()[:40],
+                "threshold": money_value(item.get("threshold")),
+                "discount": money_value(item.get("discount")),
+                "active": bool(item.get("active", True)),
+            }
+        except (TypeError, ValueError):
+            continue
+        if rule["threshold"] > 0 and rule["discount"] > 0:
+            amount_discounts.append(rule)
+
     return {
-      amount_gifts: Array.isArray(data.amount_gifts) ? data.amount_gifts : [],
-      quantity_gifts: Array.isArray(data.quantity_gifts) ? data.quantity_gifts : [],
-      amount_discounts: Array.isArray(data.amount_discounts) ? data.amount_discounts : [],
-    };
-  } catch (error) {
-    return { amount_gifts: [], quantity_gifts: [], amount_discounts: [] };
-  }
-}
-
-function giftOptions(selectedId = 0) {
-  const gifts = adminState.products.filter((product) => product.is_gift);
-  return [`<option value="">选择赠品</option>`, ...gifts.map((product) => (
-    `<option value="${product.id}" ${Number(selectedId) === product.id ? "selected" : ""}>${escapeHtml(product.name)}（库存 ${product.stock}${Number(product.stock || 0) <= 0 ? "，已送完" : ""}）</option>`
-  ))].join("");
-}
-
-function promoGiftOptions(selectedId = 0) {
-  const gifts = adminState.products.filter((product) => product.is_gift);
-  if (!gifts.length) return `<option value="">先添加赠品商品</option>`;
-  return [`<option value="">选择赠品</option>`, ...gifts.map((product) => (
-    `<option value="${product.id}" ${Number(selectedId) === product.id ? "selected" : ""}>${escapeHtml(product.name)}（库存 ${product.stock}${Number(product.stock || 0) <= 0 ? "，已送完" : ""}）</option>`
-  ))].join("");
-}
-
-function promoProductOptions(selectedIds = []) {
-  const selected = new Set((selectedIds || []).map(Number));
-  return adminState.products.filter((product) => !product.is_gift).map((product) => (
-    `<option value="${product.id}" ${selected.has(product.id) ? "selected" : ""}>${escapeHtml(product.name)}（${escapeHtml(product.tags || "无标签")}）</option>`
-  )).join("");
-}
-
-function promoGiftOptions(selectedId = 0) {
-  const gifts = adminState.products.filter((product) => product.is_gift);
-  if (!gifts.length) return `<option value="">先添加赠品商品</option>`;
-  return [`<option value="">选择赠品</option>`, ...gifts.map((product) => (
-    `<option value="${product.id}" ${Number(selectedId) === product.id ? "selected" : ""}>${escapeHtml(product.name)}（库存 ${product.stock}${Number(product.stock || 0) <= 0 ? "，已送完" : ""}）</option>`
-  ))].join("");
-}
-
-function promoProductOptions(selectedIds = []) {
-  const selected = new Set((selectedIds || []).map(Number));
-  return adminState.products.filter((product) => !product.is_gift).map((product) => (
-    `<option value="${product.id}" ${selected.has(product.id) ? "selected" : ""}>${escapeHtml(product.name)}（${escapeHtml(product.tags || "无标签")}）</option>`
-  )).join("");
-}
-
-function currentStaffName() {
-  return adminState.staffName.trim() || "摊主";
-}
-
-function normalizeCurrentStaff() {
-  const members = staffMembers();
-  if (!members.length) {
-    adminState.staffName = "摊主";
-    localStorage.setItem("booth_staff_name", adminState.staffName);
-    return;
-  }
-  if (!members.includes(currentStaffName())) {
-    adminState.staffName = members[0];
-    localStorage.setItem("booth_staff_name", adminState.staffName);
-  }
-}
-
-function showAdminToast(message) {
-  let toast = document.querySelector("#adminToast");
-  if (!toast) {
-    toast = document.createElement("div");
-    toast.id = "adminToast";
-    toast.className = "toast";
-    document.body.appendChild(toast);
-  }
-  toast.textContent = message;
-  toast.classList.add("show");
-  clearTimeout(showAdminToast.timer);
-  showAdminToast.timer = setTimeout(() => toast.classList.remove("show"), 1800);
-}
-
-function updateStaffBadge() {
-  const badge = document.querySelector("#currentStaffBadge");
-  if (badge) badge.textContent = `当前摊员：${currentStaffName()}`;
-}
-
-function fileToDataUrl(input) {
-  return new Promise((resolve, reject) => {
-    const file = input.files && input.files[0];
-    if (!file) return resolve("");
-    if (file.size > 1024 * 1024) {
-      showAdminToast("图片超过 1MB，建议压缩后再上传");
+        "amount_gifts": amount_gifts,
+        "quantity_gifts": quantity_gifts,
+        "amount_discounts": amount_discounts,
     }
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(new Error("图片读取失败"));
-    reader.readAsDataURL(file);
-  });
-}
 
-function beep() {
-  if (!adminState.soundOn) return;
-  const AudioContext = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContext) return;
-  const ctx = adminState.audioContext || new AudioContext();
-  adminState.audioContext = ctx;
-  if (ctx.state === "suspended") ctx.resume();
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.frequency.value = 880;
-  gain.gain.setValueAtTime(0.001, ctx.currentTime);
-  gain.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + 0.02);
-  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.28);
-  osc.connect(gain);
-  gain.connect(ctx.destination);
-  osc.start();
-  osc.stop(ctx.currentTime + 0.3);
-}
 
-function unlockAudio() {
-  const AudioContext = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContext) return;
-  adminState.audioContext = adminState.audioContext || new AudioContext();
-  if (adminState.audioContext.state === "suspended") adminState.audioContext.resume();
-}
+def promotions_from_settings(settings: dict) -> dict:
+    return clean_promotions(settings.get("promotions", "{}"))
 
-function notify(order) {
-  beep();
-  if (Notification.permission === "granted") {
-    new Notification("你有新订单啦", {
-      body: `取单码 ${order.pickup_code}，${money(order.total)}`,
-    });
-  }
-}
 
-async function loadLoginStaffChoices() {
-  const select = document.querySelector("#loginStaffSelect");
-  const input = document.querySelector("#loginStaffInput");
-  if (!select || !input) return;
-  try {
-    const data = await api("/api/admin/staff-list");
-    const members = data.staff_members || [];
-    select.innerHTML = members.map((name) => `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`).join("");
-    if (members.length) {
-      select.hidden = false;
-      input.hidden = true;
-      const saved = localStorage.getItem("booth_staff_name");
-      select.value = members.includes(saved) ? saved : members[0];
-    } else {
-      select.hidden = true;
-      input.hidden = false;
-      input.value = "摊主";
+def split_tags(value: str) -> set[str]:
+    normalized = value.replace("，", ",").replace("、", ",").replace("；", ",").replace(";", ",")
+    return {item.strip() for item in normalized.split(",") if item.strip()}
+
+
+def quantity_rule_matches(product: sqlite3.Row, rule: dict) -> bool:
+    trigger_type = rule.get("trigger_type", "all")
+    if trigger_type == "tag":
+        tag = str(rule.get("trigger_tag") or "").strip()
+        if not tag:
+            return False
+        if tag in split_tags(str(product["tags"])):
+            return True
+        searchable = " ".join(str(product[key] or "") for key in ("name", "category", "author", "tags"))
+        return tag in searchable
+    if trigger_type == "products":
+        return int(product["id"]) in set(rule.get("trigger_product_ids", []))
+    return True
+
+
+def require_admin(handler: BaseHTTPRequestHandler) -> bool:
+    jar = cookies.SimpleCookie(handler.headers.get("Cookie"))
+    token = jar.get(ADMIN_COOKIE)
+    if token and token.value in SESSIONS:
+        return True
+    write_json(handler, 401, {"error": "需要先登录后台"})
+    return False
+
+
+def row_to_product(row: sqlite3.Row) -> dict:
+    data = dict(row)
+    data["active"] = bool(data["active"])
+    data["is_gift"] = bool(data.get("is_gift", 0))
+    data["image"] = product_media_url(int(data["id"]), str(data.get("image") or ""))
+    return data
+
+
+def product_image_from_reference(conn: sqlite3.Connection, value: str) -> str:
+    parsed = urlparse(value)
+    if not parsed.path.startswith(PRODUCT_MEDIA_PREFIX):
+        return value
+    raw_id = parsed.path.removeprefix(PRODUCT_MEDIA_PREFIX).strip("/")
+    try:
+        product_id = int(raw_id)
+    except ValueError:
+        return ""
+    row = conn.execute("SELECT image FROM products WHERE id = ?", (product_id,)).fetchone()
+    return str(row["image"] or "") if row else ""
+
+
+def decode_media_value(value: str) -> tuple[str, bytes] | None:
+    if not value.startswith("data:") or "," not in value:
+        return None
+    header, encoded = value.split(",", 1)
+    media_type = header[5:].split(";", 1)[0] or "application/octet-stream"
+    if not media_type.startswith("image/"):
+        return None
+    try:
+        if ";base64" in header.lower():
+            payload = base64.b64decode(encoded, validate=False)
+        else:
+            payload = unquote_to_bytes(encoded)
+    except (ValueError, binascii.Error):
+        return None
+    return media_type, payload
+
+
+def list_products(conn: sqlite3.Connection, admin: bool = False) -> list[dict]:
+    query = "SELECT * FROM products"
+    if not admin:
+        query += " WHERE active = 1 AND is_gift = 0"
+    query += " ORDER BY is_gift, CASE WHEN stock <= 0 THEN 1 ELSE 0 END, category, author, id DESC"
+    return [row_to_product(row) for row in conn.execute(query).fetchall()]
+
+
+def generate_pickup_code(conn: sqlite3.Connection) -> str:
+    prefix = datetime.now().strftime("%m%d")
+    count = conn.execute(
+        "SELECT COUNT(*) AS c FROM orders WHERE pickup_code LIKE ?",
+        (f"{prefix}-%",),
+    ).fetchone()["c"]
+    return f"{prefix}-{count + 1:03d}"
+
+
+def order_detail(conn: sqlite3.Connection, order_id: int) -> dict | None:
+    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if not order:
+        return None
+    items = conn.execute(
+        "SELECT * FROM order_items WHERE order_id = ? ORDER BY id",
+        (order_id,),
+    ).fetchall()
+    data = dict(order)
+    data["items"] = [dict(item) for item in items]
+    return data
+
+
+def list_orders(conn: sqlite3.Connection, order_date: str = "") -> list[dict]:
+    params: list[str] = []
+    query = "SELECT * FROM orders"
+    if order_date:
+        query += " WHERE substr(created_at, 1, 10) = ?"
+        params.append(order_date)
+    query += " ORDER BY id DESC"
+    orders = conn.execute(query, params).fetchall()
+    result = []
+    for order in orders:
+        data = dict(order)
+        items = conn.execute(
+            "SELECT * FROM order_items WHERE order_id = ? ORDER BY id",
+            (order["id"],),
+        ).fetchall()
+        data["items"] = [dict(item) for item in items]
+        result.append(data)
+    return result
+
+
+def sales_stats(conn: sqlite3.Connection, order_date: str = "") -> dict:
+    params: list[str] = []
+    where = "WHERE o.order_status != 'cancelled'"
+    if order_date:
+        where += " AND substr(o.created_at, 1, 10) = ?"
+        params.append(order_date)
+    totals = conn.execute(
+        f"""
+        SELECT
+            COUNT(DISTINCT o.id) AS order_count,
+            COALESCE(SUM(oi.quantity), 0) AS sold_quantity,
+            0 AS sales_total
+        FROM orders o
+        LEFT JOIN order_items oi ON oi.order_id = o.id
+        {where}
+        """,
+        params,
+    ).fetchone()
+    revenue = conn.execute(
+        f"""
+        SELECT COALESCE(ROUND(SUM(o.total), 2), 0) AS sales_total
+        FROM orders o
+        {where}
+        """,
+        params,
+    ).fetchone()
+    products = conn.execute(
+        f"""
+        SELECT
+            oi.name,
+            oi.author,
+            oi.category,
+            oi.item_type,
+            oi.price,
+            SUM(oi.quantity) AS sold_quantity,
+            ROUND(SUM(oi.price * oi.quantity), 2) AS sales_total
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        {where}
+        GROUP BY oi.name, oi.author, oi.category, oi.item_type, oi.price
+        ORDER BY sales_total DESC, sold_quantity DESC, oi.name
+        """,
+        params,
+    ).fetchall()
+    author_rows = conn.execute(
+        f"""
+        SELECT
+            o.id AS order_id,
+            o.discount_total,
+            oi.author,
+            oi.item_type,
+            oi.price,
+            oi.quantity
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        {where}
+        ORDER BY o.id, oi.id
+        """,
+        params,
+    ).fetchall()
+    rows_by_order: dict[int, list[sqlite3.Row]] = {}
+    discounts_by_order: dict[int, float] = {}
+    for row in author_rows:
+        order_id = int(row["order_id"])
+        rows_by_order.setdefault(order_id, []).append(row)
+        discounts_by_order[order_id] = float(row["discount_total"] or 0)
+
+    author_map: dict[str, dict] = {}
+    for order_id, rows in rows_by_order.items():
+        sale_gross_total = sum(
+            round(float(row["price"] or 0) * int(row["quantity"] or 0), 2)
+            for row in rows
+            if row["item_type"] != "gift" and float(row["price"] or 0) > 0
+        )
+        discount_total = min(round(float(discounts_by_order.get(order_id, 0)), 2), sale_gross_total)
+        touched_authors: set[str] = set()
+        for row in rows:
+            author = str(row["author"] or "").strip() or "未填作者"
+            data = author_map.setdefault(author, {
+                "author": author,
+                "order_ids": set(),
+                "sold_quantity": 0,
+                "gift_quantity": 0,
+                "gross_sales": 0.0,
+                "discount_share": 0.0,
+                "net_sales": 0.0,
+            })
+            quantity = int(row["quantity"] or 0)
+            line_gross = round(float(row["price"] or 0) * quantity, 2)
+            if row["item_type"] == "gift":
+                data["gift_quantity"] += quantity
+            else:
+                data["sold_quantity"] += quantity
+                data["gross_sales"] += line_gross
+                if sale_gross_total > 0 and line_gross > 0 and discount_total > 0:
+                    data["discount_share"] += discount_total * line_gross / sale_gross_total
+            touched_authors.add(author)
+        for author in touched_authors:
+            author_map[author]["order_ids"].add(order_id)
+
+    author_stats = []
+    for data in author_map.values():
+        gross_sales = round(data["gross_sales"], 2)
+        discount_share = round(data["discount_share"], 2)
+        author_stats.append({
+            "author": data["author"],
+            "order_count": len(data["order_ids"]),
+            "sold_quantity": data["sold_quantity"],
+            "gift_quantity": data["gift_quantity"],
+            "gross_sales": gross_sales,
+            "discount_share": discount_share,
+            "net_sales": round(max(0.0, gross_sales - discount_share), 2),
+        })
+    author_stats.sort(key=lambda row: (-row["net_sales"], -row["sold_quantity"], row["author"]))
+    return {
+        "order_count": totals["order_count"],
+        "sold_quantity": totals["sold_quantity"],
+        "sales_total": revenue["sales_total"],
+        "products": [dict(row) for row in products],
+        "authors": author_stats,
+        "orders": list_orders(conn, order_date=order_date),
     }
-  } catch (error) {
-    select.hidden = true;
-    input.hidden = false;
-    input.value = "摊主";
-  }
-}
-
-function getLoginStaffName() {
-  const select = document.querySelector("#loginStaffSelect");
-  const input = document.querySelector("#loginStaffInput");
-  return (select && !select.hidden ? select.value : input?.value || "").trim();
-}
-
-async function checkLogin() {
-  const data = await api("/api/admin/me");
-  document.querySelector("#loginView").hidden = data.ok;
-  if (data.ok) {
-    adminState.staffName = localStorage.getItem("booth_staff_name") || adminState.staffName || "摊主";
-    mountAdminView();
-    await loadAll(false);
-  } else {
-    document.querySelector("#adminMount").innerHTML = "";
-    adminState.mounted = false;
-  }
-}
-
-function mountAdminView() {
-  if (adminState.mounted) return;
-  document.querySelector("#adminMount").innerHTML = `
-    <section id="adminView">
-      <header class="admin-header">
-        <div class="admin-header-copy">
-          <span class="section-kicker">摊位工作台</span>
-          <h1>订单看板</h1>
-          <p id="adminSubtitle">今日订单</p>
-        </div>
-        <nav class="admin-tabs">
-          <button class="active" data-tab="orders">订单</button>
-          <button data-tab="products">商品</button>
-          <button data-tab="settings">摊位</button>
-          <button data-tab="sales">销售情况</button>
-          <button id="logoutBtn" type="button">退出</button>
-        </nav>
-      </header>
-
-      <main>
-        <section id="ordersTab" class="tab-panel">
-          <div class="section-heading admin-section-heading">
-            <div>
-              <span class="section-kicker">现场处理</span>
-              <h2>今日订单</h2>
-            </div>
-          </div>
-          <div class="board-actions">
-            <button id="enableNotify" class="ghost-btn" type="button">开启系统通知</button>
-            <button id="soundToggle" class="ghost-btn" type="button">声音：开</button>
-            <span id="currentStaffBadge" class="staff-badge">当前摊员：${escapeHtml(currentStaffName())}</span>
-            <span class="small-muted">订单看板默认显示今天订单。</span>
-          </div>
-          <div class="kanban">
-            <div class="lane"><h2>新订单<span id="countNew">0</span></h2><div id="laneNew"></div></div>
-            <div class="lane"><h2>拣货中<span id="countPicking">0</span></h2><div id="lanePicking"></div></div>
-            <div class="lane"><h2>待取单<span id="countReady">0</span></h2><div id="laneReady"></div></div>
-            <div class="lane"><h2>已完成<span id="countDone">0</span></h2><div id="laneDone"></div></div>
-          </div>
-        </section>
-
-        <section id="productsTab" class="tab-panel" hidden>
-          <div class="section-heading admin-section-heading">
-            <div>
-              <span class="section-kicker">商品管理</span>
-              <h2>商品与库存</h2>
-            </div>
-          </div>
-          <form id="productForm" class="editor-form">
-            <input type="hidden" id="productId">
-            <label>商品名<input id="productName" required></label>
-            <label>价格<input id="productPrice" type="number" min="0" step="0.01" required></label>
-            <label>库存<input id="productStock" type="number" min="0" step="1" required></label>
-            <label>分类<input id="productCategory" placeholder="徽章 / 纸品 / 套组"></label>
-            <label>作者 / 合摊成员<input id="productAuthor" list="authorOptions" placeholder="用于分账统计"></label>
-            <datalist id="authorOptions"></datalist>
-            <label class="wide-field">标签<input id="productTags" placeholder="作品、角色、属性，用逗号隔开"></label>
-            <div id="tagSuggestions" class="tag-suggestions"></div>
-            <label class="wide-field">图片
-              <input id="productImage" type="file" accept="image/*">
-              <span class="form-hint">建议上传实体图，尽量压缩到 1MB 以内。</span>
-            </label>
-            <label class="check-row"><input id="productActive" type="checkbox" checked> 上架</label>
-            <button class="primary-btn" type="submit">保存商品</button>
-            <button id="resetProduct" class="ghost-btn" type="button">清空表单</button>
-          </form>
-          <div class="list-heading"><h2>商品列表</h2></div>
-          <div class="product-toolbar">
-            <input id="productSearch" type="search" placeholder="搜索商品名、作者、分类或标签">
-            <select id="productFilter">
-              <option value="all">全部商品</option>
-              <option value="active">在售</option>
-              <option value="low">低库存</option>
-              <option value="soldout">售罄</option>
-              <option value="gift">赠品</option>
-              <option value="hidden">已下架</option>
-            </select>
-            <select id="productAuthorFilter">
-              <option value="">全部作者</option>
-            </select>
-            <button id="bulkDeleteProducts" class="ghost-btn danger-action" type="button" disabled>批量删除</button>
-            <span id="productBulkState" class="bulk-state">已选 0 个</span>
-          </div>
-          <div id="productList" class="admin-list product-management-list"></div>
-        </section>
-
-        <section id="settingsTab" class="tab-panel" hidden>
-          <div class="section-heading admin-section-heading">
-            <div>
-              <span class="section-kicker">摊位管理</span>
-              <h2>展示与收款</h2>
-            </div>
-          </div>
-          <form id="settingsForm" class="editor-form settings-form">
-            <label>摊位名<input id="settingBoothName"></label>
-            <label>欢迎语<textarea id="settingWelcome" rows="3"></textarea></label>
-            <label>Logo<input id="settingLogo" type="file" accept="image/*"></label>
-            <label>微信收款码<input id="settingWechat" type="file" accept="image/*"></label>
-            <label>支付宝收款码<input id="settingAlipay" type="file" accept="image/*"></label>
-            <label>修改后台密码<input id="settingPassword" type="password" placeholder="不改就留空"></label>
-            <button class="primary-btn" type="submit">保存摊位设置</button>
-          </form>
-          <section class="staff-manager">
-            <div>
-              <h2>摊员管理</h2>
-              <p class="small-muted">这里的摊员只用于后台登录和拣货分配，买家页面不会展示。</p>
-            </div>
-            <div id="staffList" class="staff-list"></div>
-            <div class="staff-add-row">
-              <input id="newStaffName" type="text" placeholder="摊员名字，如 AA / 小林">
-              <button id="addStaffBtn" class="ghost-btn" type="button">添加摊员</button>
-            </div>
-          </section>
-        </section>
-
-        <section id="salesTab" class="tab-panel" hidden>
-          <div class="section-heading admin-section-heading">
-            <div>
-              <span class="section-kicker">经营记录</span>
-              <h2>销售情况</h2>
-            </div>
-          </div>
-          <div class="board-actions sales-toolbar">
-            <label class="date-filter">销售日期
-              <input id="salesDateInput" type="date">
-            </label>
-            <button id="allSales" class="ghost-btn" type="button">全部历史</button>
-            <button id="todaySales" class="ghost-btn" type="button">今天</button>
-            <a class="ghost-link" href="/api/admin/export">导出订单明细</a>
-            <a class="ghost-link" href="/api/admin/export-summary">导出商品汇总</a>
-            <a id="authorExportLink" class="ghost-link" href="/api/admin/export-authors">导出作者分账</a>
-            <span id="salesScopeLabel" class="sales-scope">今天</span>
-          </div>
-          <div class="sales-summary">
-            <div><span>订单数</span><strong id="salesOrderCount">0</strong></div>
-            <div><span>售出件数</span><strong id="salesQuantity">0</strong></div>
-            <div><span>营业总额</span><strong id="salesTotal">¥0.00</strong></div>
-          </div>
-          <section class="sales-data-section">
-            <div class="sales-section-heading">
-              <span class="section-kicker">合摊结算</span>
-              <h2>作者分账</h2>
-            </div>
-            <div id="salesAuthorList" class="author-sales-list"></div>
-          </section>
-          <section class="sales-data-section">
-            <div class="sales-section-heading">
-              <span class="section-kicker">制品汇总</span>
-              <h2>单制品销量统计</h2>
-            </div>
-            <div id="salesProductList" class="sales-product-list"></div>
-          </section>
-          <section class="sales-data-section sales-orders-section">
-            <div class="sales-section-heading">
-              <span class="section-kicker">逐单核对</span>
-              <h2>订单明细</h2>
-            </div>
-            <div id="salesOrderList" class="sales-order-list"></div>
-          </section>
-        </section>
-      </main>
-    </section>
-  `;
-  adminState.mounted = true;
-  enhanceAdminForms();
-  bindAdminViewEvents();
-}
-
-function enhanceAdminForms() {
-  const stock = document.querySelector("#productStock");
-  if (stock && !document.querySelector("#productLowStock")) {
-    stock.closest("label").insertAdjacentHTML("afterend", `
-      <label>低库存提醒<input id="productLowStock" type="number" min="0" step="1" value="3"></label>
-    `);
-  }
-  const image = document.querySelector("#productImage");
-  if (image && !document.querySelector("#productGift")) {
-    image.closest("label").insertAdjacentHTML("afterend", `
-      <label class="check-row"><input id="productGift" type="checkbox"> 赠品/不可购买</label>
-    `);
-  }
-  const settingsForm = document.querySelector("#settingsForm");
-  if (settingsForm && !document.querySelector("#promotionEditor")) {
-    settingsForm.insertAdjacentHTML("afterend", `
-      <section id="promotionEditor" class="staff-manager promotion-manager">
-        <div>
-          <h2>促销规则</h2>
-          <p class="small-muted">赠品需要先在商品里添加，并勾选“赠品/不可购买”。每条规则满足后赠送一次。</p>
-        </div>
-        <div class="promo-block">
-          <h3>满额赠品</h3>
-          <div id="amountGiftRules" class="promo-list"></div>
-          <button class="ghost-btn" type="button" data-add-promo="amount_gifts">添加满额赠品</button>
-        </div>
-        <div class="promo-block">
-          <h3>买件赠品</h3>
-          <div id="quantityGiftRules" class="promo-list"></div>
-          <button class="ghost-btn" type="button" data-add-promo="quantity_gifts">添加买件赠品</button>
-        </div>
-        <div class="promo-block">
-          <h3>满额减价</h3>
-          <div id="amountDiscountRules" class="promo-list"></div>
-          <button class="ghost-btn" type="button" data-add-promo="amount_discounts">添加满额减价</button>
-        </div>
-        <button id="savePromotions" class="primary-btn" type="button">保存促销规则</button>
-      </section>
-    `);
-  }
-}
-
-async function login(event) {
-  event.preventDefault();
-  const staffName = getLoginStaffName();
-  if (!staffName) return alert("请先填写或选择摊员身份");
-  try {
-    unlockAudio();
-    const result = await api("/api/admin/login", {
-      method: "POST",
-      body: JSON.stringify({
-        password: document.querySelector("#passwordInput").value,
-        staff_name: staffName,
-      }),
-    });
-    adminState.staffName = result.staff_name || staffName;
-    localStorage.setItem("booth_staff_name", adminState.staffName);
-    await checkLogin();
-  } catch (error) {
-    alert(error.message);
-  }
-}
-
-function isClaimedByOther(order) {
-  return order.picker_name && order.picker_name !== currentStaffName();
-}
-
-function pickingProgress(order) {
-  const total = order.items.length;
-  const done = order.items.filter((item) => item.picked).length;
-  return { done, total, complete: total > 0 && done === total };
-}
-
-function orderActionButtons(order) {
-  const actions = [];
-  if (order.order_status === "new") {
-    actions.push(`<button class="primary-btn" data-claim-order="${order.id}">开始拣货</button>`);
-  }
-  if (order.order_status === "picking") {
-    if (!order.picker_name) {
-      actions.push(`<button class="primary-btn" data-claim-order="${order.id}">开始拣货</button>`);
-      actions.push(`<button class="ghost-btn" data-order-status="${order.id}:new">撤回新订单</button>`);
-      return actions.join("");
-    }
-    if (isClaimedByOther(order)) {
-      actions.push(`<button class="ghost-btn" data-transfer-order="${order.id}">转交给我</button>`);
-    } else {
-      const progress = pickingProgress(order);
-      actions.push(`<button class="primary-btn" data-order-status="${order.id}:ready">${progress.complete ? "待取单" : "未拣完也待取单"}</button>`);
-      actions.push(`<button class="ghost-btn" data-release-order="${order.id}">释放拣货</button>`);
-    }
-    actions.push(`<button class="ghost-btn" data-order-status="${order.id}:new">撤回新订单</button>`);
-  }
-  if (order.order_status === "ready") {
-    if (order.payment_status === "pending") {
-      actions.push(`<button class="ghost-btn" data-pay-status="${order.id}:verified">已核验</button>`);
-    }
-    if (order.payment_status === "cash_pending") {
-      actions.push(`<button class="ghost-btn" data-pay-status="${order.id}:cash_received">现金已收</button>`);
-    }
-    actions.push(`<button class="primary-btn" data-order-status="${order.id}:completed">已取单</button>`);
-    actions.push(`<button class="ghost-btn" data-order-status="${order.id}:picking">撤回拣货中</button>`);
-  }
-  if (order.order_status === "completed") {
-    actions.push(`<button class="ghost-btn" data-order-status="${order.id}:ready">撤回待取单</button>`);
-  }
-  return actions.join("");
-}
-
-function orderItemsMarkup(order, interactive = false) {
-  const canPick = interactive && order.order_status === "picking" && !isClaimedByOther(order);
-  return `
-    <div class="pick-list">
-      ${order.items.map((item) => {
-        const gift = isGiftItem(item);
-        const promotion = gift && item.promotion_name ? `<small>来自：${escapeHtml(item.promotion_name)}</small>` : "";
-        return `
-        <button class="pick-line ${item.picked ? "picked" : ""} ${gift ? "gift-line" : ""}" type="button" data-pick-item="${item.id}" data-picked="${item.picked ? "1" : "0"}" ${canPick ? "" : "disabled"}>
-          <span class="pick-box">${item.picked ? "✓" : ""}</span>
-          <span class="pick-text">${gift ? giftBadge() : ""}${escapeHtml(item.name)} × ${item.quantity}${promotion}</span>
-          <span class="pick-price">${money(item.price)}</span>
-        </button>
-      `;
-      }).join("")}
-    </div>
-  `;
-}
-
-function pickerMeta(order) {
-  const progress = pickingProgress(order);
-  if (order.order_status === "picking" && order.picker_name) {
-    const time = order.picker_at ? ` · ${order.picker_at.slice(11, 16)}` : "";
-    return `<p class="order-meta picker-meta">拣货中：${escapeHtml(order.picker_name)}${time}${progress.total ? ` · ${progress.done}/${progress.total}` : ""}</p>`;
-  }
-  if (order.order_status === "ready" && order.picker_name) {
-    const time = order.ready_at ? ` · ${order.ready_at.slice(11, 16)}` : "";
-    return `<p class="order-meta picker-meta">拣货完成：${escapeHtml(order.picker_name)}${time}</p>`;
-  }
-  return "";
-}
-
-function renderOrders() {
-  const lanes = {
-    new: document.querySelector("#laneNew"),
-    picking: document.querySelector("#lanePicking"),
-    ready: document.querySelector("#laneReady"),
-    completed: document.querySelector("#laneDone"),
-  };
-  Object.values(lanes).forEach((lane) => lane.innerHTML = "");
-  const counts = { new: 0, picking: 0, ready: 0, completed: 0 };
-  const sortedOrders = [...adminState.orders].sort((a, b) => {
-    if (a.order_status === "ready" && b.order_status === "ready") {
-      return (b.ready_at || b.updated_at || "").localeCompare(a.ready_at || a.updated_at || "");
-    }
-    return b.id - a.id;
-  });
-  for (const order of sortedOrders) {
-    const laneKey = order.order_status === "cancelled" ? "completed" : order.order_status;
-    counts[laneKey] = (counts[laneKey] || 0) + 1;
-    const payBadgeClass = ["verified", "cash_received"].includes(order.payment_status) ? "ok" : "warn";
-    const contact = order.receive_type === "later" ? `电话 ${order.phone || "未填"}` : `尾号 ${order.phone_tail || "未填"}`;
-    const card = document.createElement("article");
-    card.className = `order-card ${order.id > adminState.lastOrderId ? "new-flash" : ""}`;
-    card.innerHTML = `
-      <div class="order-code-row">
-        <div>
-          <div class="order-code">${escapeHtml(order.pickup_code)}</div>
-          <div class="order-meta">${escapeHtml(order.created_at)}</div>
-        </div>
-        <div>
-          <span class="badge ${payBadgeClass}">${payText[order.payment_status]}</span>
-        </div>
-      </div>
-      <p class="order-meta">${receiveText[order.receive_type]} · ${methodText[order.payment_method]} · ${escapeHtml(contact)}</p>
-      ${pickerMeta(order)}
-      ${order.pickup_time ? `<p class="order-meta">预计领取：${escapeHtml(order.pickup_time)}</p>` : ""}
-      ${orderItemsMarkup(order, true)}
-      ${priceSummaryMarkup(order, true)}
-      ${order.note ? `<p class="order-note"><strong>备注：</strong>${escapeHtml(order.note)}</p>` : ""}
-      <div class="order-actions">
-        ${orderActionButtons(order)}
-      </div>
-    `;
-    lanes[laneKey]?.appendChild(card);
-  }
-  document.querySelector("#countNew").textContent = counts.new;
-  document.querySelector("#countPicking").textContent = counts.picking;
-  document.querySelector("#countReady").textContent = counts.ready;
-  document.querySelector("#countDone").textContent = counts.completed;
-  updateStaffBadge();
-}
-
-function renderProducts() {
-  const list = document.querySelector("#productList");
-  if (!list) return;
-  renderProductTools();
-  const visibleProducts = filteredProducts();
-  list.innerHTML = visibleProducts.map((product) => {
-    const giftEmpty = product.is_gift && Number(product.stock || 0) <= 0;
-    const lowStock = !product.is_gift && product.active && Number(product.stock || 0) > 0 && Number(product.stock || 0) <= Number(product.low_stock_threshold ?? 3);
-    const selected = adminState.selectedProductIds.has(product.id);
-    return `
-    <article class="admin-product ${giftEmpty ? "gift-empty" : ""}">
-      <div class="product-admin-row">
-        <label class="product-select" title="选择商品">
-          <input type="checkbox" data-select-product="${product.id}" ${selected ? "checked" : ""}>
-        </label>
-        <div>
-          <strong>${escapeHtml(product.name)}${product.is_gift ? giftBadge() : ""}${giftEmpty ? `<span class="stock-alert-badge">赠品已送完</span>` : ""}${lowStock ? `<span class="badge warn">低库存</span>` : ""}</strong>
-          <div class="product-author-line">
-            <span class="author-pill">作者：${escapeHtml(product.author || "未填作者")}</span>
-            <span class="badge">${escapeHtml(product.category || "未分类")}</span>
-          </div>
-          <div class="product-tag-row">${productTagsMarkup(product.tags)}</div>
-          <p>${money(product.price)} · 库存 ${product.stock} · ${product.is_gift ? "不可购买" : (product.active ? "上架" : "下架")}</p>
-        </div>
-        ${product.image ? `<img src="${product.image}" alt="${escapeHtml(product.name)}">` : ""}
-      </div>
-      <div class="admin-product-actions">
-        <button class="ghost-btn" data-copy-product="${product.id}">复制新增</button>
-        <button class="ghost-btn" data-edit-product="${product.id}">编辑</button>
-        <button class="ghost-btn danger-text" data-delete-product="${product.id}">删除</button>
-      </div>
-    </article>
-  `;
-  }).join("") || `<p class="small-muted">没有找到符合条件的商品</p>`;
-}
-
-function salesScopeText() {
-  return adminState.salesDate ? `${adminState.salesDate} 订单` : "全部历史订单";
-}
-
-function orderDateKey(order) {
-  return String(order.created_at || "").slice(0, 10) || "未记录日期";
-}
-
-function salesOrderCard(order) {
-  const paid = ["verified", "cash_received"].includes(order.payment_status);
-  const contact = order.receive_type === "later"
-    ? `电话 ${escapeHtml(order.phone || "未填")}`
-    : `尾号 ${escapeHtml(order.phone_tail || "未填")}`;
-  return `
-    <article class="sales-order-card">
-      <div class="order-code-row">
-        <div>
-          <div class="order-code">${escapeHtml(order.pickup_code)}</div>
-          <div class="sales-order-badges">
-            <span class="badge">${statusText[order.order_status] || order.order_status}</span>
-            <span class="badge ${paid ? "ok" : "warn"}">${payText[order.payment_status] || order.payment_status}</span>
-          </div>
-        </div>
-        <strong class="sales-order-total">${money(order.total)}</strong>
-      </div>
-      <div class="sales-order-facts">
-        <span>${escapeHtml(order.created_at)}</span>
-        <span>${receiveText[order.receive_type]} · ${methodText[order.payment_method]}</span>
-        <span>${contact}</span>
-        ${order.pickup_time ? `<span>预计领取 ${escapeHtml(order.pickup_time)}</span>` : ""}
-      </div>
-      <ol class="sales-order-items">${order.items.map((item) => `<li>${orderItemLine(item)}</li>`).join("")}</ol>
-    </article>
-  `;
-}
-
-function renderSalesOrders(orderList, orders) {
-  if (!orders.length) {
-    orderList.innerHTML = `<p class="small-muted">这个范围内还没有订单</p>`;
-    return;
-  }
-  if (adminState.salesDate) {
-    orderList.innerHTML = `<div class="sales-order-grid">${orders.map(salesOrderCard).join("")}</div>`;
-    return;
-  }
-  const groups = new Map();
-  orders.forEach((order) => {
-    const key = orderDateKey(order);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(order);
-  });
-  orderList.innerHTML = [...groups.entries()].map(([date, dayOrders]) => `
-    <section class="sales-date-group">
-      <h3>${escapeHtml(date)}<span>${dayOrders.length} 单</span></h3>
-      <div class="sales-order-grid">${dayOrders.map(salesOrderCard).join("")}</div>
-    </section>
-  `).join("");
-}
-
-function renderSales() {
-  if (!adminState.sales || !document.querySelector("#salesOrderCount")) return;
-  document.querySelector("#salesOrderCount").textContent = adminState.sales.order_count;
-  document.querySelector("#salesQuantity").textContent = adminState.sales.sold_quantity;
-  document.querySelector("#salesTotal").textContent = money(adminState.sales.sales_total);
-  document.querySelector("#salesDateInput").value = adminState.salesDate;
-  document.querySelector("#salesScopeLabel").textContent = salesScopeText();
-  const exportQuery = adminState.salesDate ? `?date=${encodeURIComponent(adminState.salesDate)}` : "";
-  document.querySelector("#authorExportLink").href = `/api/admin/export-authors${exportQuery}`;
-
-  const authorList = document.querySelector("#salesAuthorList");
-  authorList.innerHTML = (adminState.sales.authors || []).map((author) => `
-    <article class="author-share-card">
-      <div>
-        <strong>${escapeHtml(author.author)}</strong>
-        <span>${author.order_count} 单 · 售出 ${author.sold_quantity} 件 · 赠品 ${author.gift_quantity} 件</span>
-      </div>
-      <dl>
-        <div><dt>原价</dt><dd>${money(author.gross_sales)}</dd></div>
-        <div><dt>分摊优惠</dt><dd>- ${money(author.discount_share)}</dd></div>
-        <div><dt>分账金额</dt><dd>${money(author.net_sales)}</dd></div>
-      </dl>
-    </article>
-  `).join("") || `<p class="small-muted">这个范围内还没有作者分账数据</p>`;
-
-  const list = document.querySelector("#salesProductList");
-  list.innerHTML = adminState.sales.products.map((product) => `
-    <article class="sales-product-row">
-      <div class="sales-product-name">
-        <strong>${escapeHtml(product.name)}${isGiftItem(product) ? giftBadge() : ""}</strong>
-        <div class="product-author-line">
-          <span class="author-pill">作者：${escapeHtml(product.author || "未填作者")}</span>
-          <span class="badge">${escapeHtml(product.category || "未分类")}</span>
-        </div>
-      </div>
-      <dl class="sales-product-metrics">
-        <div><dt>单价</dt><dd>${money(product.price)}</dd></div>
-        <div><dt>${isGiftItem(product) ? "赠出数量" : "售出数量"}</dt><dd>${product.sold_quantity} 件</dd></div>
-        <div><dt>销售额</dt><dd>${money(product.sales_total)}</dd></div>
-      </dl>
-    </article>
-  `).join("") || `<p class="small-muted">这个范围内还没有销售记录</p>`;
-  const orderList = document.querySelector("#salesOrderList");
-  renderSalesOrders(orderList, adminState.sales.orders || []);
-}
-
-function fillProductForm(product) {
-  document.querySelector("#productId").value = product?.id || "";
-  document.querySelector("#productName").value = product?.name || "";
-  document.querySelector("#productPrice").value = product?.price || "";
-  document.querySelector("#productStock").value = product?.stock ?? "";
-  if (document.querySelector("#productLowStock")) document.querySelector("#productLowStock").value = product?.low_stock_threshold ?? 3;
-  document.querySelector("#productCategory").value = product?.category || "";
-  document.querySelector("#productAuthor").value = product?.author || "";
-  document.querySelector("#productTags").value = product?.tags || "";
-  if (document.querySelector("#productGift")) document.querySelector("#productGift").checked = Boolean(product?.is_gift);
-  document.querySelector("#productActive").checked = product?.active ?? true;
-  document.querySelector("#productImage").value = "";
-  adminState.editingImage = product?.image || "";
-}
-
-function copyProductToForm(product) {
-  fillProductForm(product);
-  document.querySelector("#productId").value = "";
-  const nameInput = document.querySelector("#productName");
-  window.scrollTo({ top: 0, behavior: "smooth" });
-  nameInput.focus();
-  nameInput.select();
-  showAdminToast("制品信息已复制，修改名称后保存即可新增");
-}
-
-function renderStaffManager() {
-  const list = document.querySelector("#staffList");
-  if (!list) return;
-  const members = staffMembers();
-  list.innerHTML = members.map((name) => `
-    <div class="staff-row">
-      <strong>${escapeHtml(name)}</strong>
-      <div>
-        <button class="ghost-btn" type="button" data-rename-staff="${escapeHtml(name)}">改名</button>
-        <button class="ghost-btn" type="button" data-delete-staff="${escapeHtml(name)}">删除</button>
-      </div>
-    </div>
-  `).join("") || `<p class="small-muted">还没有配置摊员。未配置时，登录页会允许直接用“摊主”进入。</p>`;
-}
-
-function isGiftItem(item) {
-  return item?.item_type === "gift" || item?.is_gift;
-}
-
-function giftBadge() {
-  return `<span class="gift-badge">赠品</span>`;
-}
-
-function productTagsMarkup(tags) {
-  const values = splitTags(tags);
-  if (!values.length) return `<span class="small-muted">无标签</span>`;
-  return values.map((tag) => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("");
-}
-
-function productMatchesFilter(product) {
-  const search = adminState.productSearch.trim().toLowerCase();
-  if (search) {
-    const haystack = [product.name, product.author, product.category, product.tags]
-      .map((value) => String(value || "").toLowerCase())
-      .join(" ");
-    if (!haystack.includes(search)) return false;
-  }
-  if (adminState.productAuthorFilter && product.author !== adminState.productAuthorFilter) return false;
-  const stock = Number(product.stock || 0);
-  const low = Number(product.low_stock_threshold ?? 3);
-  if (adminState.productFilter === "active") return product.active && !product.is_gift;
-  if (adminState.productFilter === "low") return product.active && !product.is_gift && stock > 0 && stock <= low;
-  if (adminState.productFilter === "soldout") return stock <= 0;
-  if (adminState.productFilter === "gift") return Boolean(product.is_gift);
-  if (adminState.productFilter === "hidden") return !product.active;
-  return true;
-}
-
-function filteredProducts() {
-  return adminState.products.filter(productMatchesFilter);
-}
-
-function renderProductTools() {
-  const search = document.querySelector("#productSearch");
-  const filter = document.querySelector("#productFilter");
-  const authorFilter = document.querySelector("#productAuthorFilter");
-  const bulkState = document.querySelector("#productBulkState");
-  const bulkButton = document.querySelector("#bulkDeleteProducts");
-  const authorOptions = document.querySelector("#authorOptions");
-  if (!search || !filter || !authorFilter) return;
-
-  search.value = adminState.productSearch;
-  filter.value = adminState.productFilter;
-  const authors = uniqueSorted(adminState.products.map((product) => product.author));
-  authorFilter.innerHTML = `<option value="">全部作者</option>${authors.map((author) => (
-    `<option value="${escapeHtml(author)}" ${adminState.productAuthorFilter === author ? "selected" : ""}>${escapeHtml(author)}</option>`
-  )).join("")}`;
-  if (authorOptions) {
-    authorOptions.innerHTML = authors.map((author) => `<option value="${escapeHtml(author)}"></option>`).join("");
-  }
-  const validIds = new Set(adminState.products.map((product) => product.id));
-  adminState.selectedProductIds = new Set([...adminState.selectedProductIds].filter((id) => validIds.has(id)));
-  if (bulkState) bulkState.textContent = `已选 ${adminState.selectedProductIds.size} 个`;
-  if (bulkButton) bulkButton.disabled = adminState.selectedProductIds.size === 0;
-  renderTagSuggestions();
-}
-
-function renderTagSuggestions() {
-  const mount = document.querySelector("#tagSuggestions");
-  if (!mount) return;
-  const tags = uniqueSorted(adminState.products.flatMap((product) => splitTags(product.tags))).slice(0, 28);
-  mount.innerHTML = tags.length
-    ? `<span>常用标签</span>${tags.map((tag) => `<button type="button" data-add-tag="${escapeHtml(tag)}">${escapeHtml(tag)}</button>`).join("")}`
-    : `<span>保存商品后，会在这里显示常用标签。</span>`;
-}
-
-function addTagToForm(tag) {
-  const input = document.querySelector("#productTags");
-  if (!input) return;
-  const tags = splitTags(input.value);
-  if (!tags.includes(tag)) tags.push(tag);
-  input.value = tags.join("，");
-  input.focus();
-}
-
-function promoGiftOptions(selectedId = 0) {
-  const gifts = adminState.products.filter((product) => product.is_gift);
-  if (!gifts.length) return `<option value="">先添加赠品商品</option>`;
-  return [`<option value="">选择赠品</option>`, ...gifts.map((product) => (
-    `<option value="${product.id}" ${Number(selectedId) === product.id ? "selected" : ""}>${escapeHtml(product.name)}（库存 ${product.stock}${Number(product.stock || 0) <= 0 ? "，已送完" : ""}）</option>`
-  ))].join("");
-}
-
-function promoProductPicker(selectedIds = []) {
-  const selected = new Set((selectedIds || []).map(Number));
-  const products = adminState.products.filter((product) => !product.is_gift);
-  if (!products.length) return `<p class="small-muted">还没有可售商品</p>`;
-  return `
-    <div class="promo-product-picker">
-      ${products.map((product) => {
-        const meta = [product.category, product.author, product.tags].filter(Boolean).join(" · ");
-        return `
-          <label class="promo-product-option">
-            <input type="checkbox" data-promo-product value="${product.id}" ${selected.has(product.id) ? "checked" : ""}>
-            <span>
-              <strong>${escapeHtml(product.name)}</strong>
-              ${meta ? `<small>${escapeHtml(meta)}</small>` : ""}
-            </span>
-          </label>
-        `;
-      }).join("")}
-    </div>
-  `;
-}
-
-function promotionTriggerType(rule) {
-  return ["all", "tag", "products"].includes(rule?.trigger_type) ? rule.trigger_type : "all";
-}
-
-function syncPromotionRowVisibility(row) {
-  if (!row) return;
-  const triggerType = row.querySelector('[data-promo-field="trigger_type"]')?.value || "all";
-  row.classList.remove("trigger-all", "trigger-tag", "trigger-products");
-  row.classList.add(`trigger-${triggerType}`);
-}
-
-function priceSummaryMarkup(order, compact = false) {
-  const subtotal = Number(order.subtotal || order.total || 0);
-  const discount = Number(order.discount_total || 0);
-  const total = Number(order.total || 0);
-  if (discount <= 0) {
-    return `<p class="${compact ? "order-total-line compact" : "order-total-line"}"><strong>合计 ${money(total)}</strong></p>`;
-  }
-  return `
-    <div class="${compact ? "price-breakdown compact" : "price-breakdown"}">
-      <div><span>原价</span><strong>${money(subtotal)}</strong></div>
-      <div class="discount"><span>满减</span><strong>- ${money(discount)}</strong></div>
-      <div class="final"><span>优惠后</span><strong>${money(total)}</strong></div>
-    </div>
-  `;
-}
-
-function orderItemLine(item) {
-  const gift = isGiftItem(item);
-  const promotion = gift && item.promotion_name ? ` <span class="item-promo">来自：${escapeHtml(item.promotion_name)}</span>` : "";
-  return `${gift ? giftBadge() : ""}${escapeHtml(item.name)} × ${item.quantity}：${money(item.price)}${promotion}`;
-}
-
-function renderPromotions() {
-  if (!document.querySelector("#promotionEditor")) return;
-  const data = promotions();
-  document.querySelector("#amountGiftRules").innerHTML = data.amount_gifts.map((rule, index) => `
-    <div class="promo-row" data-promo-row="amount_gifts:${index}">
-      <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="规则名">
-      <input data-promo-field="threshold" type="number" min="0" step="0.01" value="${rule.threshold || ""}" placeholder="满额">
-      <select data-promo-field="gift_product_id">${giftOptions(rule.gift_product_id)}</select>
-      <input data-promo-field="gift_quantity" type="number" min="1" step="1" value="${rule.gift_quantity || 1}" placeholder="数量">
-      <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
-      <button class="ghost-btn" type="button" data-remove-promo="amount_gifts:${index}">删除</button>
-    </div>
-  `).join("") || `<p class="small-muted">还没有满额赠品规则</p>`;
-  document.querySelector("#quantityGiftRules").innerHTML = data.quantity_gifts.map((rule, index) => `
-    <div class="promo-row" data-promo-row="quantity_gifts:${index}">
-      <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="规则名">
-      <input data-promo-field="buy_quantity" type="number" min="1" step="1" value="${rule.buy_quantity || ""}" placeholder="买满件数">
-      <select data-promo-field="gift_product_id">${giftOptions(rule.gift_product_id)}</select>
-      <input data-promo-field="gift_quantity" type="number" min="1" step="1" value="${rule.gift_quantity || 1}" placeholder="数量">
-      <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
-      <button class="ghost-btn" type="button" data-remove-promo="quantity_gifts:${index}">删除</button>
-    </div>
-  `).join("") || `<p class="small-muted">还没有买件赠品规则</p>`;
-  document.querySelector("#amountDiscountRules").innerHTML = data.amount_discounts.map((rule, index) => `
-    <div class="promo-row" data-promo-row="amount_discounts:${index}">
-      <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="规则名">
-      <input data-promo-field="threshold" type="number" min="0" step="0.01" value="${rule.threshold || ""}" placeholder="满额">
-      <input data-promo-field="discount" type="number" min="0" step="0.01" value="${rule.discount || ""}" placeholder="减价">
-      <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
-      <button class="ghost-btn" type="button" data-remove-promo="amount_discounts:${index}">删除</button>
-    </div>
-  `).join("") || `<p class="small-muted">还没有满额减价规则</p>`;
-}
-
-function renderPromotions() {
-  if (!document.querySelector("#promotionEditor")) return;
-  const data = promotions();
-  document.querySelector("#amountGiftRules").innerHTML = data.amount_gifts.map((rule, index) => `
-    <div class="promo-row promo-rule" data-promo-row="amount_gifts:${index}">
-      <div class="promo-rule-title"><strong>满额赠品</strong><span>第 ${index + 1} 条</span></div>
-      <label class="promo-field">规则名
-        <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="例如 满 100 送明信片">
-      </label>
-      <label class="promo-field">订单满额
-        <input data-promo-field="threshold" type="number" min="0" step="0.01" value="${rule.threshold || ""}" placeholder="满多少元">
-      </label>
-      <label class="promo-field">赠品
-        <select data-promo-field="gift_product_id">${promoGiftOptions(rule.gift_product_id)}</select>
-      </label>
-      <label class="promo-field">赠送数量
-        <input data-promo-field="gift_quantity" type="number" min="1" step="1" value="${rule.gift_quantity || 1}">
-      </label>
-      <div class="promo-rule-actions">
-        <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
-        <button class="ghost-btn" type="button" data-remove-promo="amount_gifts:${index}">删除</button>
-      </div>
-    </div>
-  `).join("") || `<p class="small-muted">还没有满额赠品规则</p>`;
-
-  document.querySelector("#quantityGiftRules").innerHTML = data.quantity_gifts.map((rule, index) => `
-    <div class="promo-row promo-rule promo-quantity-rule trigger-${promotionTriggerType(rule)}" data-promo-row="quantity_gifts:${index}">
-      <div class="promo-rule-title"><strong>买件赠品</strong><span>第 ${index + 1} 条</span></div>
-      <label class="promo-field">规则名
-        <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="例如 买吧唧送小卡">
-      </label>
-      <label class="promo-field">买哪些商品
-        <select data-promo-field="trigger_type">
-        <option value="all" ${(rule.trigger_type || "all") === "all" ? "selected" : ""}>全部商品</option>
-        <option value="tag" ${rule.trigger_type === "tag" ? "selected" : ""}>指定标签</option>
-        <option value="products" ${rule.trigger_type === "products" ? "selected" : ""}>指定商品</option>
-        </select>
-      </label>
-      <label class="promo-field promo-tag-field">触发标签
-        <input data-promo-field="trigger_tag" value="${escapeHtml(rule.trigger_tag || "")}" placeholder="和商品标签完全一致">
-      </label>
-      <div class="promo-field promo-products-field">
-        <span>指定商品</span>
-        ${promoProductPicker(rule.trigger_product_ids)}
-      </div>
-      <label class="promo-field">买满件数
-        <input data-promo-field="buy_quantity" type="number" min="1" step="1" value="${rule.buy_quantity || 1}">
-      </label>
-      <label class="promo-field">赠品
-        <select data-promo-field="gift_product_id">${promoGiftOptions(rule.gift_product_id)}</select>
-      </label>
-      <label class="promo-field">赠送数量
-        <input data-promo-field="gift_quantity" type="number" min="1" step="1" value="${rule.gift_quantity || 1}">
-      </label>
-      <div class="promo-rule-actions">
-        <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
-        <button class="ghost-btn" type="button" data-remove-promo="quantity_gifts:${index}">删除</button>
-      </div>
-    </div>
-  `).join("") || `<p class="small-muted">还没有买件赠品规则</p>`;
-
-  document.querySelector("#amountDiscountRules").innerHTML = data.amount_discounts.map((rule, index) => `
-    <div class="promo-row promo-rule" data-promo-row="amount_discounts:${index}">
-      <div class="promo-rule-title"><strong>满额减价</strong><span>第 ${index + 1} 条</span></div>
-      <label class="promo-field">规则名
-        <input data-promo-field="name" value="${escapeHtml(rule.name || "")}" placeholder="例如 满 100 减 10">
-      </label>
-      <label class="promo-field">订单满额
-        <input data-promo-field="threshold" type="number" min="0" step="0.01" value="${rule.threshold || ""}" placeholder="满多少元">
-      </label>
-      <label class="promo-field">减价金额
-        <input data-promo-field="discount" type="number" min="0" step="0.01" value="${rule.discount || ""}" placeholder="减多少元">
-      </label>
-      <div class="promo-rule-actions">
-        <label class="check-row"><input data-promo-field="active" type="checkbox" ${rule.active === false ? "" : "checked"}> 启用</label>
-        <button class="ghost-btn" type="button" data-remove-promo="amount_discounts:${index}">删除</button>
-      </div>
-    </div>
-  `).join("") || `<p class="small-muted">还没有满额减价规则</p>`;
-}
-
-function renderSettings(force = false) {
-  if (adminState.settingsDirty && !force) return;
-  document.querySelector("#settingBoothName").value = adminState.settings.booth_name || "";
-  document.querySelector("#settingWelcome").value = adminState.settings.welcome || "";
-  adminState.settingImages = {
-    logo: adminState.settings.logo || "",
-    wechat_qr: adminState.settings.wechat_qr || "",
-    alipay_qr: adminState.settings.alipay_qr || "",
-  };
-  renderStaffManager();
-  if (!adminState.promotionsDirty || force) renderPromotions();
-}
-
-async function loadAll(playNotice = true) {
-  adminState.orderDate = new Date().toISOString().slice(0, 10);
-  const dateQuery = `?date=${encodeURIComponent(adminState.orderDate)}`;
-  const [orders, products, settings] = await Promise.all([
-    api(`/api/admin/orders${dateQuery}`),
-    api("/api/admin/products"),
-    api("/api/admin/settings"),
-  ]);
-  const newest = orders.reduce((max, order) => Math.max(max, order.id), 0);
-  const oldLast = adminState.lastOrderId;
-  adminState.orders = orders;
-  adminState.products = products;
-  adminState.settings = settings;
-  normalizeCurrentStaff();
-  renderOrders();
-  renderProducts();
-  renderSettings(false);
-  if (playNotice && oldLast && newest > oldLast) {
-    const newOrder = orders.find((order) => order.id === newest);
-    if (newOrder) notify(newOrder);
-  }
-  adminState.lastOrderId = Math.max(adminState.lastOrderId, newest);
-}
-
-async function loadSales() {
-  const dateQuery = adminState.salesDate ? `?date=${encodeURIComponent(adminState.salesDate)}` : "";
-  adminState.sales = await api(`/api/admin/sales${dateQuery}`);
-  renderSales();
-}
-
-async function deleteSelectedProducts() {
-  const ids = [...adminState.selectedProductIds];
-  if (!ids.length) return;
-  if (!confirm(`确定删除选中的 ${ids.length} 个商品吗？历史订单不会删除，但这些商品会从当前商品列表移除。`)) return;
-  await Promise.all(ids.map((id) => api(`/api/admin/products/${id}`, { method: "DELETE" })));
-  adminState.selectedProductIds.clear();
-  showAdminToast("已批量删除商品");
-  await loadAll(false);
-}
-
-async function saveProduct(event) {
-  event.preventDefault();
-  try {
-    const image = await fileToDataUrl(document.querySelector("#productImage")) || adminState.editingImage;
-    const payload = {
-      name: document.querySelector("#productName").value,
-      price: Number(document.querySelector("#productPrice").value),
-      stock: Number(document.querySelector("#productStock").value),
-      low_stock_threshold: Number(document.querySelector("#productLowStock")?.value || 3),
-      category: document.querySelector("#productCategory").value,
-      author: document.querySelector("#productAuthor").value,
-      tags: document.querySelector("#productTags").value,
-      image,
-      is_gift: Boolean(document.querySelector("#productGift")?.checked),
-      active: document.querySelector("#productActive").checked,
-    };
-    const id = document.querySelector("#productId").value;
-    await api(id ? `/api/admin/products/${id}` : "/api/admin/products", {
-      method: id ? "PATCH" : "POST",
-      body: JSON.stringify(payload),
-    });
-    fillProductForm(null);
-    showAdminToast("商品已保存");
-    await loadAll(false);
-  } catch (error) {
-    alert(error.message);
-  }
-}
-
-async function saveSettings(event) {
-  event.preventDefault();
-  try {
-    const logo = await fileToDataUrl(document.querySelector("#settingLogo")) || adminState.settingImages.logo;
-    const wechat = await fileToDataUrl(document.querySelector("#settingWechat")) || adminState.settingImages.wechat_qr;
-    const alipay = await fileToDataUrl(document.querySelector("#settingAlipay")) || adminState.settingImages.alipay_qr;
-    const payload = {
-      booth_name: document.querySelector("#settingBoothName").value,
-      welcome: document.querySelector("#settingWelcome").value,
-      logo,
-      wechat_qr: wechat,
-      alipay_qr: alipay,
-    };
-    const password = document.querySelector("#settingPassword").value;
-    if (password) payload.admin_password = password;
-    await api("/api/admin/settings", { method: "POST", body: JSON.stringify(payload) });
-    adminState.settingsDirty = false;
-    document.querySelector("#settingPassword").value = "";
-    showAdminToast("摊位设置已保存");
-    await loadAll(false);
-  } catch (error) {
-    alert(error.message);
-  }
-}
-
-async function saveStaffMembers(members) {
-  const clean = [];
-  const seen = new Set();
-  for (const member of members) {
-    const name = String(member || "").trim().slice(0, 30);
-    if (name && !seen.has(name)) {
-      clean.push(name);
-      seen.add(name);
-    }
-  }
-  await api("/api/admin/settings", {
-    method: "POST",
-    body: JSON.stringify({ staff_members: JSON.stringify(clean) }),
-  });
-  adminState.settings = { ...adminState.settings, staff_members: JSON.stringify(clean) };
-  if (clean.length && !clean.includes(currentStaffName())) {
-    adminState.staffName = clean[0];
-    localStorage.setItem("booth_staff_name", adminState.staffName);
-  }
-  renderStaffManager();
-  renderOrders();
-  await loadLoginStaffChoices();
-}
-
-function collectPromotions() {
-  const data = { amount_gifts: [], quantity_gifts: [], amount_discounts: [] };
-  document.querySelectorAll("[data-promo-row]").forEach((row) => {
-    const [type] = row.dataset.promoRow.split(":");
-    const rule = {};
-    row.querySelectorAll("[data-promo-field]").forEach((field) => {
-      const key = field.dataset.promoField;
-      if (field.multiple) rule[key] = Array.from(field.selectedOptions).map((option) => Number(option.value)).filter(Boolean);
-      else if (field.type === "checkbox") rule[key] = field.checked;
-      else if (["threshold", "discount"].includes(key)) rule[key] = Number(field.value || 0);
-      else if (["gift_product_id", "gift_quantity", "buy_quantity"].includes(key)) rule[key] = Number(field.value || 0);
-      else rule[key] = field.value.trim();
-    });
-    const productChecks = row.querySelectorAll("[data-promo-product]");
-    if (productChecks.length) {
-      rule.trigger_product_ids = Array.from(productChecks)
-        .filter((field) => field.checked)
-        .map((field) => Number(field.value))
-        .filter(Boolean);
-    }
-    data[type].push(rule);
-  });
-  return data;
-}
-
-function currentPromotionDraft() {
-  return document.querySelector("[data-promo-row]") ? collectPromotions() : promotions();
-}
-
-async function savePromotions() {
-  const next = collectPromotions();
-  await api("/api/admin/settings", {
-    method: "POST",
-    body: JSON.stringify({ promotions: JSON.stringify(next) }),
-  });
-  adminState.settings = { ...adminState.settings, promotions: JSON.stringify(next) };
-  adminState.promotionsDirty = false;
-  renderPromotions();
-  showAdminToast("促销规则已保存");
-}
-
-function addPromotion(type) {
-  const data = currentPromotionDraft();
-  if (type === "amount_gifts") {
-    data.amount_gifts.push({ name: "满额赠品", threshold: 0, gift_product_id: 0, gift_quantity: 1, active: true });
-  }
-  if (type === "quantity_gifts") {
-    data.quantity_gifts.push({ name: "买件赠品", trigger_type: "all", trigger_tag: "", trigger_product_ids: [], buy_quantity: 1, gift_product_id: 0, gift_quantity: 1, active: true });
-  }
-  if (type === "amount_discounts") {
-    data.amount_discounts.push({ name: "满额减价", threshold: 0, discount: 0, active: true });
-  }
-  adminState.settings.promotions = JSON.stringify(data);
-  adminState.promotionsDirty = true;
-  renderPromotions();
-}
-
-function removePromotion(value) {
-  const [type, indexText] = value.split(":");
-  const data = currentPromotionDraft();
-  data[type].splice(Number(indexText), 1);
-  adminState.settings.promotions = JSON.stringify(data);
-  adminState.promotionsDirty = true;
-  renderPromotions();
-}
-
-async function updateOrder(id, field, value, extra = {}) {
-  const payload = field === "status" ? { order_status: value } : { payment_status: value };
-  Object.assign(payload, extra);
-  await api(`/api/admin/orders/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
-  await loadAll(false);
-}
-
-async function claimOrder(id) {
-  try {
-    await updateOrder(id, "status", "picking", { picker_name: currentStaffName() });
-    showAdminToast(`已分配给 ${currentStaffName()}`);
-  } catch (error) {
-    if (error.status === 409) {
-      showAdminToast(error.message);
-      await loadAll(false);
-      return;
-    }
-    throw error;
-  }
-}
-
-async function transferOrder(id) {
-  if (!confirm("确定把这张单转交给自己拣货吗？")) return;
-  await updateOrder(id, "status", "picking", { picker_name: currentStaffName(), force_picker: true });
-  showAdminToast(`已转交给 ${currentStaffName()}`);
-}
-
-async function releaseOrder(id) {
-  await api(`/api/admin/orders/${id}`, {
-    method: "PATCH",
-    body: JSON.stringify({ picker_name: "" }),
-  });
-  showAdminToast("已释放拣货");
-  await loadAll(false);
-}
-
-async function togglePicked(itemId, picked) {
-  await api(`/api/admin/order-items/${itemId}`, {
-    method: "PATCH",
-    body: JSON.stringify({ picked }),
-  });
-  await loadAll(false);
-}
-
-document.querySelector("#loginForm").addEventListener("submit", login);
-document.addEventListener("pointerdown", unlockAudio, { once: true });
-document.addEventListener("input", (event) => {
-  if (event.target.closest("#promotionEditor")) adminState.promotionsDirty = true;
-});
-document.addEventListener("change", (event) => {
-  const selectedProduct = event.target.closest("[data-select-product]");
-  if (selectedProduct) {
-    const id = Number(selectedProduct.dataset.selectProduct);
-    if (selectedProduct.checked) adminState.selectedProductIds.add(id);
-    else adminState.selectedProductIds.delete(id);
-    renderProducts();
-  }
-  if (event.target.closest("#promotionEditor")) adminState.promotionsDirty = true;
-  if (event.target.matches('[data-promo-field="trigger_type"]')) {
-    syncPromotionRowVisibility(event.target.closest("[data-promo-row]"));
-  }
-});
-
-function bindAdminViewEvents() {
-  document.querySelector("#productForm").addEventListener("submit", saveProduct);
-  document.querySelector("#settingsForm").addEventListener("submit", saveSettings);
-  document.querySelector("#settingsForm").addEventListener("input", () => {
-    adminState.settingsDirty = true;
-  });
-  document.querySelector("#addStaffBtn").addEventListener("click", async () => {
-    const input = document.querySelector("#newStaffName");
-    const name = input.value.trim();
-    if (!name) return;
-    const members = staffMembers();
-    if (members.includes(name)) return showAdminToast("这个摊员已经在名单里了");
-    await saveStaffMembers([...members, name]);
-    input.value = "";
-    showAdminToast("摊员已添加");
-  });
-  document.querySelector("#resetProduct").addEventListener("click", () => fillProductForm(null));
-  document.querySelector("#productSearch").addEventListener("input", (event) => {
-    adminState.productSearch = event.target.value;
-    renderProducts();
-  });
-  document.querySelector("#productFilter").addEventListener("change", (event) => {
-    adminState.productFilter = event.target.value;
-    renderProducts();
-  });
-  document.querySelector("#productAuthorFilter").addEventListener("change", (event) => {
-    adminState.productAuthorFilter = event.target.value;
-    renderProducts();
-  });
-  document.querySelector("#bulkDeleteProducts").addEventListener("click", () => {
-    deleteSelectedProducts().catch((error) => alert(error.message));
-  });
-  document.querySelector("#soundToggle").addEventListener("click", (event) => {
-    unlockAudio();
-    adminState.soundOn = !adminState.soundOn;
-    event.target.textContent = `声音：${adminState.soundOn ? "开" : "关"}`;
-    if (adminState.soundOn) beep();
-  });
-  document.querySelector("#enableNotify").addEventListener("click", async () => {
-    unlockAudio();
-    if (!("Notification" in window)) return alert("这个浏览器不支持系统通知");
-    const result = await Notification.requestPermission();
-    alert(result === "granted" ? "通知已开启" : "通知没有开启");
-  });
-  document.querySelector("#logoutBtn").addEventListener("click", async () => {
-    try {
-      await api("/api/admin/logout", { method: "POST" });
-    } catch (error) {
-      console.warn("退出请求失败，已在本页退出登录。", error);
-    }
-    document.cookie = "booth_admin=; Path=/; Max-Age=0; SameSite=Lax";
-    adminState.mounted = false;
-    adminState.orders = [];
-    adminState.products = [];
-    adminState.sales = null;
-    document.querySelector("#adminMount").innerHTML = "";
-    document.querySelector("#passwordInput").value = "";
-    document.querySelector("#loginView").hidden = false;
-    await loadLoginStaffChoices();
-  });
-  document.querySelector("#salesDateInput").addEventListener("change", async (event) => {
-    adminState.salesDate = event.target.value;
-    await loadSales();
-  });
-  document.querySelector("#allSales").addEventListener("click", async () => {
-    adminState.salesDate = "";
-    document.querySelector("#salesDateInput").value = "";
-    await loadSales();
-  });
-  document.querySelector("#todaySales").addEventListener("click", async () => {
-    adminState.salesDate = localDateString();
-    document.querySelector("#salesDateInput").value = adminState.salesDate;
-    await loadSales();
-  });
-  document.querySelector(".admin-tabs").addEventListener("click", (event) => {
-    const btn = event.target.closest("[data-tab]");
-    if (!btn) return;
-    document.querySelectorAll(".admin-tabs button").forEach((item) => item.classList.toggle("active", item === btn));
-    document.querySelectorAll(".tab-panel").forEach((panel) => panel.hidden = true);
-    document.querySelector(`#${btn.dataset.tab}Tab`).hidden = false;
-    if (btn.dataset.tab === "sales") loadSales().catch((error) => alert(error.message));
-  });
-}
-
-document.addEventListener("click", async (event) => {
-  const status = event.target.closest("[data-order-status]");
-  const pay = event.target.closest("[data-pay-status]");
-  const claim = event.target.closest("[data-claim-order]");
-  const transfer = event.target.closest("[data-transfer-order]");
-  const release = event.target.closest("[data-release-order]");
-  const pickItem = event.target.closest("[data-pick-item]");
-  const copyProduct = event.target.closest("[data-copy-product]");
-  const edit = event.target.closest("[data-edit-product]");
-  const del = event.target.closest("[data-delete-product]");
-  const renameStaff = event.target.closest("[data-rename-staff]");
-  const deleteStaff = event.target.closest("[data-delete-staff]");
-  const addPromo = event.target.closest("[data-add-promo]");
-  const removePromo = event.target.closest("[data-remove-promo]");
-  const savePromo = event.target.closest("#savePromotions");
-  const addTag = event.target.closest("[data-add-tag]");
-  try {
-    if (addTag) addTagToForm(addTag.dataset.addTag);
-    if (claim) await claimOrder(claim.dataset.claimOrder);
-    if (transfer) await transferOrder(transfer.dataset.transferOrder);
-    if (release) await releaseOrder(release.dataset.releaseOrder);
-    if (pickItem) {
-      const nextPicked = pickItem.dataset.picked !== "1";
-      await togglePicked(pickItem.dataset.pickItem, nextPicked);
-    }
-    if (status) {
-      const [id, value] = status.dataset.orderStatus.split(":");
-      const order = adminState.orders.find((item) => item.id === Number(id));
-      const unpaid = order && !["verified", "cash_received"].includes(order.payment_status);
-      const progress = order ? pickingProgress(order) : { complete: true };
-      const extra = value === "picking" && order && !order.picker_name ? { picker_name: currentStaffName() } : {};
-      if (value === "ready" && order?.order_status === "picking" && !progress.complete && !confirm("还有商品没有勾选完成，确定标记为待取单吗？")) return;
-      if (value === "completed" && unpaid && !confirm("这单还没有核验付款，确定标记为已取单吗？")) return;
-      await updateOrder(id, "status", value, extra);
-    }
-    if (pay) {
-      const [id, value] = pay.dataset.payStatus.split(":");
-      await updateOrder(id, "pay", value);
-    }
-    if (copyProduct) {
-      const product = adminState.products.find((item) => item.id === Number(copyProduct.dataset.copyProduct));
-      if (product) copyProductToForm(product);
-    }
-    if (edit) {
-      const product = adminState.products.find((item) => item.id === Number(edit.dataset.editProduct));
-      fillProductForm(product);
-      window.scrollTo({ top: 0, behavior: "smooth" });
-    }
-    if (del && confirm("确定删除这个商品吗？")) {
-      await api(`/api/admin/products/${del.dataset.deleteProduct}`, { method: "DELETE" });
-      await loadAll(false);
-    }
-    if (renameStaff) {
-      const oldName = renameStaff.dataset.renameStaff;
-      const nextName = prompt("新的摊员名字", oldName)?.trim();
-      if (!nextName || nextName === oldName) return;
-      const members = staffMembers().map((name) => name === oldName ? nextName : name);
-      await saveStaffMembers(members);
-      if (currentStaffName() === oldName) {
-        adminState.staffName = nextName;
-        localStorage.setItem("booth_staff_name", nextName);
-        updateStaffBadge();
-      }
-      showAdminToast("摊员已改名");
-    }
-    if (deleteStaff && confirm("确定删除这个摊员吗？")) {
-      const oldName = deleteStaff.dataset.deleteStaff;
-      const members = staffMembers().filter((name) => name !== oldName);
-      await saveStaffMembers(members);
-      showAdminToast("摊员已删除");
-    }
-  } catch (error) {
-    alert(error.message);
-  }
-});
-
-document.addEventListener("click", async (event) => {
-  const addPromo = event.target.closest("[data-add-promo]");
-  const removePromo = event.target.closest("[data-remove-promo]");
-  const savePromo = event.target.closest("#savePromotions");
-  if (!addPromo && !removePromo && !savePromo) return;
-  try {
-    if (addPromo) addPromotion(addPromo.dataset.addPromo);
-    if (removePromo) removePromotion(removePromo.dataset.removePromo);
-    if (savePromo) await savePromotions();
-  } catch (error) {
-    alert(error.message);
-  }
-});
-
-setInterval(() => {
-  const adminView = document.querySelector("#adminView");
-  if (adminView) loadAll(true).catch(console.error);
-}, 5000);
-
-document.querySelector("#loginView").hidden = false;
-document.querySelector("#adminMount").innerHTML = "";
-adminState.mounted = false;
-loadLoginStaffChoices();
+
+
+def validate_product_payload(payload: dict) -> tuple[str, float, int, str, str, str, str, bool, int, bool]:
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        raise ValueError("商品名不能为空")
+    price = round(float(payload.get("price", 0)), 2)
+    stock = int(payload.get("stock", 0))
+    if price < 0 or stock < 0:
+        raise ValueError("价格和库存不能为负数")
+    category = str(payload.get("category", "")).strip()
+    author = str(payload.get("author", "")).strip()
+    tags = str(payload.get("tags", "")).strip()
+    image = str(payload.get("image", "")).strip()
+    active = bool(payload.get("active", True))
+    is_gift = bool(payload.get("is_gift", False))
+    low_stock_threshold = int(payload.get("low_stock_threshold", 3))
+    if low_stock_threshold < 0:
+        low_stock_threshold = 0
+    return name, price, stock, category, author, tags, image, is_gift, low_stock_threshold, active
+
+
+class BoothHandler(BaseHTTPRequestHandler):
+    server_version = "BoothOrderTool/0.1"
+
+    def log_message(self, format: str, *args) -> None:
+        return
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == "/":
+            return self.serve_file("index.html")
+        if path == ADMIN_PATH:
+            return self.serve_file("admin.html")
+        if path.startswith("/public/"):
+            return self.serve_file(path.removeprefix("/public/"))
+        if path.startswith(PRODUCT_MEDIA_PREFIX):
+            return self.serve_product_media(path)
+        if path.startswith(SETTING_MEDIA_PREFIX):
+            return self.serve_setting_media(path)
+        if path == "/api/settings":
+            with DB_LOCK, connect() as conn:
+                return write_json(self, 200, settings_dict(conn, public=True, media_urls=True))
+        if path == "/api/products":
+            with DB_LOCK, connect() as conn:
+                return write_json(self, 200, list_products(conn, admin=False))
+        if path == "/api/admin/me":
+            return write_json(self, 200, {"ok": self.is_admin()})
+        if path == "/api/admin/staff-list":
+            with DB_LOCK, connect() as conn:
+                settings = settings_dict(conn, public=False)
+            return write_json(self, 200, {"staff_members": staff_members_from_settings(settings)})
+        if path == "/api/admin/products":
+            if not require_admin(self):
+                return
+            with DB_LOCK, connect() as conn:
+                return write_json(self, 200, list_products(conn, admin=True))
+        if path == "/api/admin/orders":
+            if not require_admin(self):
+                return
+            query = parse_qs(parsed.query)
+            order_date = query.get("date", [""])[0]
+            with DB_LOCK, connect() as conn:
+                return write_json(self, 200, list_orders(conn, order_date=order_date))
+        if path == "/api/admin/settings":
+            if not require_admin(self):
+                return
+            with DB_LOCK, connect() as conn:
+                return write_json(self, 200, settings_dict(conn, public=False, media_urls=True))
+        if path == "/api/admin/sales":
+            if not require_admin(self):
+                return
+            query = parse_qs(parsed.query)
+            order_date = query.get("date", [""])[0]
+            with DB_LOCK, connect() as conn:
+                return write_json(self, 200, sales_stats(conn, order_date=order_date))
+        if path == "/api/admin/export":
+            if not require_admin(self):
+                return
+            return self.export_csv()
+        if path == "/api/admin/export-summary":
+            if not require_admin(self):
+                return
+            return self.export_summary_csv()
+        if path == "/api/admin/export-authors":
+            if not require_admin(self):
+                return
+            query = parse_qs(parsed.query)
+            order_date = query.get("date", [""])[0]
+            return self.export_author_csv(order_date=order_date)
+        write_json(self, 404, {"error": "没有找到这个页面"})
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path == "/api/admin/login":
+                return self.login()
+            if path == "/api/admin/logout":
+                return self.logout()
+            if path == "/api/orders":
+                return self.create_order_v2()
+            if path == "/api/admin/products":
+                if not require_admin(self):
+                    return
+                return self.create_product()
+            if path == "/api/admin/settings":
+                if not require_admin(self):
+                    return
+                return self.update_settings()
+        except (ValueError, json.JSONDecodeError) as exc:
+            return write_json(self, 400, {"error": str(exc)})
+        write_json(self, 404, {"error": "没有找到这个接口"})
+
+    def do_PATCH(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path.startswith("/api/admin/products/"):
+                if not require_admin(self):
+                    return
+                product_id = int(path.rsplit("/", 1)[-1])
+                return self.update_product(product_id)
+            if path.startswith("/api/admin/orders/"):
+                if not require_admin(self):
+                    return
+                order_id = int(path.rsplit("/", 1)[-1])
+                return self.update_order(order_id)
+            if path.startswith("/api/admin/order-items/"):
+                if not require_admin(self):
+                    return
+                item_id = int(path.rsplit("/", 1)[-1])
+                return self.update_order_item(item_id)
+        except (ValueError, json.JSONDecodeError) as exc:
+            return write_json(self, 400, {"error": str(exc)})
+        write_json(self, 404, {"error": "没有找到这个接口"})
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path
+        try:
+            if path.startswith("/api/admin/products/"):
+                if not require_admin(self):
+                    return
+                product_id = int(path.rsplit("/", 1)[-1])
+                with DB_LOCK, connect() as conn:
+                    conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
+                    conn.commit()
+                return write_json(self, 200, {"ok": True})
+        except ValueError as exc:
+            return write_json(self, 400, {"error": str(exc)})
+        write_json(self, 404, {"error": "没有找到这个接口"})
+
+    def is_admin(self) -> bool:
+        jar = cookies.SimpleCookie(self.headers.get("Cookie"))
+        token = jar.get(ADMIN_COOKIE)
+        return bool(token and token.value in SESSIONS)
+
+    def serve_file(self, filename: str) -> None:
+        safe = filename.strip("/").replace("\\", "/")
+        path = (PUBLIC_DIR / safe).resolve()
+        if PUBLIC_DIR.resolve() not in path.parents and path != PUBLIC_DIR.resolve():
+            return write_json(self, 403, {"error": "不能访问这个文件"})
+        if not path.exists() or path.is_dir():
+            return write_json(self, 404, {"error": "文件不存在"})
+        content_type = "text/plain; charset=utf-8"
+        if path.suffix == ".html":
+            content_type = "text/html; charset=utf-8"
+        elif path.suffix == ".css":
+            content_type = "text/css; charset=utf-8"
+        elif path.suffix == ".js":
+            content_type = "application/javascript; charset=utf-8"
+        data = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def serve_media_value(self, value: str) -> None:
+        if value.startswith(("https://", "http://")):
+            self.send_response(302)
+            self.send_header("Location", value)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        decoded = decode_media_value(value)
+        if not decoded:
+            return write_json(self, 404, {"error": "图片不存在"})
+        content_type, data = decoded
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def serve_product_media(self, path: str) -> None:
+        raw_id = path.removeprefix(PRODUCT_MEDIA_PREFIX).strip("/")
+        try:
+            product_id = int(raw_id)
+        except ValueError:
+            return write_json(self, 404, {"error": "图片不存在"})
+        with DB_LOCK, connect() as conn:
+            row = conn.execute("SELECT image FROM products WHERE id = ?", (product_id,)).fetchone()
+        if not row:
+            return write_json(self, 404, {"error": "图片不存在"})
+        self.serve_media_value(str(row["image"] or ""))
+
+    def serve_setting_media(self, path: str) -> None:
+        key = path.removeprefix(SETTING_MEDIA_PREFIX).strip("/")
+        if key not in MEDIA_SETTING_KEYS:
+            return write_json(self, 404, {"error": "图片不存在"})
+        with DB_LOCK, connect() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return write_json(self, 404, {"error": "图片不存在"})
+        self.serve_media_value(str(row["value"] or ""))
+
+    def login(self) -> None:
+        payload = read_body(self)
+        password = str(payload.get("password", ""))
+        staff_name = str(payload.get("staff_name", "")).strip()[:30]
+        with DB_LOCK, connect() as conn:
+            settings = settings_dict(conn, public=False)
+            expected = settings.get("admin_password", "123456")
+            members = staff_members_from_settings(settings)
+        if password != expected:
+            return write_json(self, 403, {"error": "密码不对"})
+        if members:
+            if not staff_name or staff_name not in members:
+                return write_json(self, 403, {"error": "请选择正确的摊员身份"})
+        elif not staff_name:
+            staff_name = "摊主"
+        token = secrets.token_urlsafe(24)
+        SESSIONS.add(token)
+        data = json.dumps({"ok": True, "staff_name": staff_name}, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", f"{ADMIN_COOKIE}={token}; Path=/; SameSite=Lax")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def logout(self) -> None:
+        jar = cookies.SimpleCookie(self.headers.get("Cookie"))
+        token = jar.get(ADMIN_COOKIE)
+        if token:
+            SESSIONS.discard(token.value)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Set-Cookie", f"{ADMIN_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax")
+        self.end_headers()
+        self.wfile.write(b'{"ok": true}')
+
+    def create_order_v2(self) -> None:
+        payload = read_body(self)
+        client_token = str(payload.get("client_token", "")).strip()[:80]
+        items = payload.get("items", [])
+        if not isinstance(items, list) or not items:
+            raise ValueError("购物车是空的")
+        receive_type = str(payload.get("receive_type", "now"))
+        phone = str(payload.get("phone", "")).strip()
+        phone_tail = str(payload.get("phone_tail", "")).strip()
+        pickup_time = str(payload.get("pickup_time", "")).strip()
+        payment_method = str(payload.get("payment_method", "wechat"))
+        note = str(payload.get("note", "")).strip()
+        if receive_type not in {"now", "later"}:
+            raise ValueError("领取方式不正确")
+        if receive_type == "later" and (not phone.isdigit() or len(phone) != 11):
+            raise ValueError("请填写正确的手机号")
+        if receive_type == "now" and (not phone_tail.isdigit() or len(phone_tail) != 4):
+            raise ValueError("现在领取请填写手机号后四位")
+        if receive_type == "later" and not pickup_time:
+            raise ValueError("稍后领取需要选择预计领取时间")
+        if receive_type == "later":
+            phone_tail = phone[-4:]
+        else:
+            phone = ""
+            pickup_time = ""
+        if payment_method not in {"wechat", "alipay", "cash"}:
+            raise ValueError("支付方式不正确")
+
+        with DB_LOCK, connect() as conn:
+            if client_token:
+                existing = conn.execute(
+                    "SELECT id FROM orders WHERE client_token = ?",
+                    (client_token,),
+                ).fetchone()
+                if existing:
+                    return write_json(self, 200, order_detail(conn, existing["id"]))
+            requested: dict[int, int] = {}
+            for item in items:
+                product_id = int(item.get("product_id"))
+                quantity = int(item.get("quantity", 1))
+                if quantity <= 0:
+                    raise ValueError("数量不正确")
+                requested[product_id] = requested.get(product_id, 0) + quantity
+
+            product_ids = list(requested.keys())
+            placeholders = ",".join("?" for _ in product_ids)
+            rows = conn.execute(
+                f"SELECT * FROM products WHERE id IN ({placeholders}) AND active = 1",
+                product_ids,
+            ).fetchall()
+            products = {row["id"]: row for row in rows}
+            clean_items = []
+            subtotal = 0.0
+            sale_quantity = 0
+            for product_id, quantity in requested.items():
+                product = products.get(product_id)
+                if not product or int(product["is_gift"]):
+                    raise ValueError("有商品已经下架")
+                if product["stock"] < quantity:
+                    raise ValueError(f"{product['name']} 库存不够了")
+                subtotal += round(float(product["price"]) * quantity, 2)
+                sale_quantity += quantity
+                clean_items.append((product, quantity))
+
+            promotions = promotions_from_settings(settings_dict(conn, public=False))
+            gift_rule_ids = sorted({
+                rule["gift_product_id"]
+                for group in ("amount_gifts", "quantity_gifts")
+                for rule in promotions[group]
+                if rule["active"] and rule["gift_product_id"] > 0
+            })
+            gift_rows = []
+            if gift_rule_ids:
+                gift_placeholders = ",".join("?" for _ in gift_rule_ids)
+                gift_rows = conn.execute(
+                    f"SELECT * FROM products WHERE id IN ({gift_placeholders})",
+                    gift_rule_ids,
+                ).fetchall()
+            gifts = {row["id"]: row for row in gift_rows}
+            gift_stock_left = {row["id"]: int(row["stock"]) for row in gift_rows}
+            gift_items = []
+            disabled_gift_ids: set[int] = set()
+
+            def claim_gift(rule: dict) -> sqlite3.Row | None:
+                product_id = int(rule["gift_product_id"])
+                quantity = int(rule["gift_quantity"])
+                gift = gifts.get(product_id)
+                remaining = gift_stock_left.get(product_id, 0)
+                if not gift or not int(gift["active"]) or not int(gift["is_gift"]):
+                    disabled_gift_ids.add(product_id)
+                    return None
+                if remaining < quantity:
+                    if remaining <= 0:
+                        disabled_gift_ids.add(product_id)
+                    return None
+                gift_stock_left[product_id] = remaining - quantity
+                if gift_stock_left[product_id] <= 0:
+                    disabled_gift_ids.add(product_id)
+                return gift
+
+            for rule in promotions["amount_gifts"]:
+                if rule["active"] and subtotal >= rule["threshold"]:
+                    gift = claim_gift(rule)
+                    if gift:
+                        gift_items.append((gift, rule["gift_quantity"], rule["name"]))
+            for rule in promotions["quantity_gifts"]:
+                matched_quantity = sum(quantity for product, quantity in clean_items if quantity_rule_matches(product, rule))
+                if rule["active"] and matched_quantity >= rule["buy_quantity"]:
+                    gift = claim_gift(rule)
+                    if gift:
+                        gift_items.append((gift, rule["gift_quantity"], rule["name"]))
+
+            promotions_dirty = False
+            if disabled_gift_ids:
+                for group in ("amount_gifts", "quantity_gifts"):
+                    for rule in promotions[group]:
+                        if rule["active"] and rule["gift_product_id"] in disabled_gift_ids:
+                            rule["active"] = False
+                            promotions_dirty = True
+
+            discount_total = 0.0
+            for rule in promotions["amount_discounts"]:
+                if rule["active"] and subtotal >= rule["threshold"]:
+                    discount_total += rule["discount"]
+            subtotal = round(subtotal, 2)
+            discount_total = min(round(discount_total, 2), subtotal)
+            total = round(max(0.0, subtotal - discount_total), 2)
+
+            pickup_code = generate_pickup_code(conn)
+            created = now_text()
+            payment_status = "cash_pending" if payment_method == "cash" else "pending"
+            cur = conn.execute(
+                """
+                INSERT INTO orders(pickup_code, client_token, receive_type, phone, phone_tail, pickup_time, payment_method, payment_status, order_status, subtotal, discount_total, total, note, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?)
+                """,
+                (pickup_code, client_token, receive_type, phone, phone_tail, pickup_time, payment_method, payment_status, subtotal, discount_total, total, note, created, created),
+            )
+            order_id = cur.lastrowid
+
+            for product, quantity in clean_items:
+                conn.execute(
+                    """
+                    INSERT INTO order_items(order_id, product_id, name, price, quantity, item_type, promotion_name, author, category, tags)
+                    VALUES(?, ?, ?, ?, ?, 'sale', '', ?, ?, ?)
+                    """,
+                    (order_id, product["id"], product["name"], product["price"], quantity, product["author"], product["category"], product["tags"]),
+                )
+                conn.execute(
+                    "UPDATE products SET stock = stock - ?, updated_at = ? WHERE id = ?",
+                    (quantity, created, product["id"]),
+                )
+
+            for product, quantity, promotion_name in gift_items:
+                conn.execute(
+                    """
+                    INSERT INTO order_items(order_id, product_id, name, price, quantity, item_type, promotion_name, author, category, tags)
+                    VALUES(?, ?, ?, 0, ?, 'gift', ?, ?, ?, ?)
+                    """,
+                    (order_id, product["id"], product["name"], quantity, promotion_name, product["author"], product["category"], product["tags"]),
+                )
+                conn.execute(
+                    "UPDATE products SET stock = stock - ?, updated_at = ? WHERE id = ?",
+                    (quantity, created, product["id"]),
+                )
+
+            if promotions_dirty:
+                conn.execute(
+                    "INSERT INTO settings(key, value) VALUES('promotions', ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (json.dumps(clean_promotions(promotions), ensure_ascii=False),),
+                )
+
+            conn.commit()
+            detail = order_detail(conn, order_id)
+        write_json(self, 201, detail)
+
+    def create_order(self) -> None:
+        payload = read_body(self)
+        items = payload.get("items", [])
+        if not isinstance(items, list) or not items:
+            raise ValueError("购物车是空的")
+        receive_type = str(payload.get("receive_type", "now"))
+        phone = str(payload.get("phone", "")).strip()
+        phone_tail = str(payload.get("phone_tail", "")).strip()
+        pickup_time = str(payload.get("pickup_time", "")).strip()
+        payment_method = str(payload.get("payment_method", "wechat"))
+        note = str(payload.get("note", "")).strip()
+        if receive_type not in {"now", "later"}:
+            raise ValueError("领取方式不正确")
+        if receive_type == "later" and not phone:
+            raise ValueError("稍后领取需要填写电话")
+        if receive_type == "later" and (not phone.isdigit() or len(phone) != 11):
+            raise ValueError("稍后领取需要填写 11 位手机号")
+        if receive_type == "now" and (not phone_tail.isdigit() or len(phone_tail) != 4):
+            raise ValueError("现在领取需要填写手机号后四位")
+        if receive_type == "later" and not pickup_time:
+            raise ValueError("稍后领取需要选择预计领取时间")
+        if receive_type == "later":
+            phone_tail = phone[-4:]
+        else:
+            phone = ""
+            pickup_time = ""
+        if payment_method not in {"wechat", "alipay", "cash"}:
+            raise ValueError("支付方式不正确")
+        with DB_LOCK, connect() as conn:
+            product_ids = [int(item.get("product_id")) for item in items]
+            placeholders = ",".join("?" for _ in product_ids)
+            rows = conn.execute(
+                f"SELECT * FROM products WHERE id IN ({placeholders}) AND active = 1",
+                product_ids,
+            ).fetchall()
+            products = {row["id"]: row for row in rows}
+            clean_items = []
+            total = 0.0
+            for item in items:
+                product_id = int(item.get("product_id"))
+                quantity = int(item.get("quantity", 1))
+                if quantity <= 0:
+                    raise ValueError("数量不正确")
+                product = products.get(product_id)
+                if not product:
+                    raise ValueError("有商品已经下架")
+                if product["stock"] < quantity:
+                    raise ValueError(f"{product['name']} 库存不够了")
+                line_total = round(float(product["price"]) * quantity, 2)
+                total += line_total
+                clean_items.append((product, quantity))
+            pickup_code = generate_pickup_code(conn)
+            created = now_text()
+            payment_status = "cash_pending" if payment_method == "cash" else "pending"
+            cur = conn.execute(
+                """
+                INSERT INTO orders(pickup_code, receive_type, phone, phone_tail, pickup_time, payment_method, payment_status, order_status, total, note, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?)
+                """,
+                (pickup_code, receive_type, phone, phone_tail, pickup_time, payment_method, payment_status, round(total, 2), note, created, created),
+            )
+            order_id = cur.lastrowid
+            for product, quantity in clean_items:
+                conn.execute(
+                    """
+                    INSERT INTO order_items(order_id, product_id, name, price, quantity, author, category, tags)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        order_id,
+                        product["id"],
+                        product["name"],
+                        product["price"],
+                        quantity,
+                        product["author"],
+                        product["category"],
+                        product["tags"],
+                    ),
+                )
+                conn.execute(
+                    "UPDATE products SET stock = stock - ?, updated_at = ? WHERE id = ?",
+                    (quantity, created, product["id"]),
+                )
+            conn.commit()
+            detail = order_detail(conn, order_id)
+        write_json(self, 201, detail)
+
+    def create_product(self) -> None:
+        payload = read_body(self)
+        fields = list(validate_product_payload(payload))
+        stamp = now_text()
+        with DB_LOCK, connect() as conn:
+            fields[6] = product_image_from_reference(conn, fields[6])
+            cur = conn.execute(
+                """
+                INSERT INTO products(name, price, stock, category, author, tags, image, is_gift, low_stock_threshold, active, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (*fields, stamp, stamp),
+            )
+            conn.commit()
+            product_id = cur.lastrowid
+        write_json(self, 201, {"ok": True, "id": product_id})
+
+    def update_product(self, product_id: int) -> None:
+        payload = read_body(self)
+        fields = list(validate_product_payload(payload))
+        stamp = now_text()
+        with DB_LOCK, connect() as conn:
+            fields[6] = product_image_from_reference(conn, fields[6])
+            conn.execute(
+                """
+                UPDATE products
+                SET name=?, price=?, stock=?, category=?, author=?, tags=?, image=?, is_gift=?, low_stock_threshold=?, active=?, updated_at=?
+                WHERE id=?
+                """,
+                (*fields, stamp, product_id),
+            )
+            conn.commit()
+            product = conn.execute("SELECT id FROM products WHERE id = ?", (product_id,)).fetchone()
+        if not product:
+            return write_json(self, 404, {"error": "商品不存在"})
+        write_json(self, 200, {"ok": True, "id": product_id})
+
+    def update_order(self, order_id: int) -> None:
+        payload = read_body(self)
+        allowed_status = {"new", "picking", "ready", "completed", "cancelled"}
+        allowed_payment = {"pending", "verified", "cash_pending", "cash_received"}
+        requested_picker = None
+        if "picker_name" in payload:
+            requested_picker = str(payload["picker_name"]).strip()[:30]
+        force_picker = bool(payload.get("force_picker"))
+        fields = []
+        params = []
+        if "order_status" in payload:
+            value = str(payload["order_status"])
+            if value not in allowed_status:
+                raise ValueError("订单状态不正确")
+            fields.append("order_status=?")
+            params.append(value)
+            if value == "ready":
+                fields.append("ready_at=?")
+                params.append(now_text())
+            if value == "new":
+                fields.append("picker_name=?")
+                params.append("")
+                fields.append("picker_at=?")
+                params.append("")
+                fields.append("ready_at=?")
+                params.append("")
+        if "picker_name" in payload:
+            value = requested_picker or ""
+            fields.append("picker_name=?")
+            params.append(value)
+            fields.append("picker_at=?")
+            params.append(now_text() if value else "")
+        if "payment_status" in payload:
+            value = str(payload["payment_status"])
+            if value not in allowed_payment:
+                raise ValueError("支付状态不正确")
+            fields.append("payment_status=?")
+            params.append(value)
+        if not fields:
+            raise ValueError("没有要更新的内容")
+        fields.append("updated_at=?")
+        params.append(now_text())
+        params.append(order_id)
+        with DB_LOCK, connect() as conn:
+            current = conn.execute("SELECT picker_name FROM orders WHERE id=?", (order_id,)).fetchone()
+            if not current:
+                return write_json(self, 404, {"error": "璁㈠崟涓嶅瓨鍦?"})
+            if requested_picker and current["picker_name"] and current["picker_name"] != requested_picker and not force_picker:
+                return write_json(
+                    self,
+                    409,
+                    {
+                        "error": f"该订单已由 {current['picker_name']} 拣货中",
+                        "picker_name": current["picker_name"],
+                    },
+                )
+            conn.execute(f"UPDATE orders SET {', '.join(fields)} WHERE id=?", params)
+            conn.commit()
+            detail = order_detail(conn, order_id)
+        if not detail:
+            return write_json(self, 404, {"error": "订单不存在"})
+        write_json(self, 200, detail)
+
+    def update_order_item(self, item_id: int) -> None:
+        payload = read_body(self)
+        picked = 1 if bool(payload.get("picked")) else 0
+        with DB_LOCK, connect() as conn:
+            item = conn.execute("SELECT order_id FROM order_items WHERE id=?", (item_id,)).fetchone()
+            if not item:
+                return write_json(self, 404, {"error": "拣货项不存在"})
+            stamp = now_text()
+            conn.execute("UPDATE order_items SET picked=? WHERE id=?", (picked, item_id))
+            conn.execute("UPDATE orders SET updated_at=? WHERE id=?", (stamp, item["order_id"]))
+            conn.commit()
+            detail = order_detail(conn, item["order_id"])
+        write_json(self, 200, detail)
+
+    def update_settings(self) -> None:
+        payload = read_body(self)
+        allowed = {"booth_name", "welcome", "logo", "wechat_qr", "alipay_qr", "admin_password", "staff_members", "promotions"}
+        with DB_LOCK, connect() as conn:
+            for key, value in payload.items():
+                if key in allowed:
+                    if key == "staff_members":
+                        value = json.dumps(staff_members_from_settings({"staff_members": value}), ensure_ascii=False)
+                    if key == "promotions":
+                        value = json.dumps(clean_promotions(value), ensure_ascii=False)
+                    if key in MEDIA_SETTING_KEYS:
+                        media_path = urlparse(str(value)).path
+                        if media_path == f"{SETTING_MEDIA_PREFIX}{key}":
+                            continue
+                    conn.execute(
+                        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (key, str(value)),
+                    )
+            conn.commit()
+        write_json(self, 200, {"ok": True})
+
+    def export_csv(self) -> None:
+        with DB_LOCK, connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    o.pickup_code, o.created_at, o.order_status, o.payment_method, o.payment_status,
+                    o.receive_type, o.phone, o.phone_tail, o.pickup_time, oi.name, oi.item_type, oi.promotion_name, oi.price, oi.quantity,
+                    ROUND(oi.price * oi.quantity, 2) AS line_total,
+                    oi.author, oi.category, oi.tags, o.total
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                ORDER BY o.id DESC, oi.id
+                """
+            ).fetchall()
+        output = []
+        header = [
+            "取单码", "下单时间", "订单状态", "支付方式", "支付状态", "领取方式", "电话", "尾号", "预计领取时间",
+            "商品名", "单价", "数量", "小计", "作者", "分类", "标签", "订单总价",
+        ]
+        header = [
+            "取单码", "下单时间", "订单状态", "支付方式", "支付状态", "领取方式", "电话", "尾号", "预计领取时间",
+            "商品名", "类型", "促销规则", "单价", "数量", "小计", "作者", "分类", "标签", "订单总价",
+        ]
+        output.append(header)
+        for row in rows:
+            output.append([row[key] for key in row.keys()])
+        text_lines = []
+        for row in output:
+            text_lines.append(",".join(csv_escape(value) for value in row))
+        data = ("\ufeff" + "\r\n".join(text_lines)).encode("utf-8")
+        filename = f"booth-sales-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def export_summary_csv(self) -> None:
+        with DB_LOCK, connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    oi.name,
+                    oi.author,
+                    oi.category,
+                    oi.tags,
+                    oi.item_type,
+                    oi.price,
+                    SUM(oi.quantity) AS sold_quantity,
+                    ROUND(SUM(oi.price * oi.quantity), 2) AS sales_total
+                FROM order_items oi
+                JOIN orders o ON o.id = oi.order_id
+                WHERE o.order_status != 'cancelled'
+                GROUP BY oi.name, oi.author, oi.category, oi.tags, oi.item_type, oi.price
+                ORDER BY oi.author, oi.category, oi.item_type, oi.name, oi.price
+                """
+            ).fetchall()
+            total = conn.execute(
+                """
+                SELECT
+                    (
+                        SELECT COALESCE(SUM(oi.quantity), 0)
+                        FROM order_items oi
+                        JOIN orders o ON o.id = oi.order_id
+                        WHERE o.order_status != 'cancelled'
+                    ) AS sold_quantity,
+                    (
+                        SELECT COALESCE(ROUND(SUM(o.total), 2), 0)
+                        FROM orders o
+                        WHERE o.order_status != 'cancelled'
+                    ) AS sales_total
+                """
+            ).fetchone()
+        output = [["商品名", "作者", "分类", "标签", "类型", "单价", "销量", "营业额"]]
+        for row in rows:
+            output.append([row[key] for key in row.keys()])
+        output.append(["总计", "", "", "", "", "", total["sold_quantity"], total["sales_total"]])
+        text_lines = [",".join(csv_escape(value) for value in row) for row in output]
+        data = ("\ufeff" + "\r\n".join(text_lines)).encode("utf-8")
+        filename = f"booth-summary-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def export_author_csv(self, order_date: str = "") -> None:
+        with DB_LOCK, connect() as conn:
+            stats = sales_stats(conn, order_date=order_date)
+        output = [[
+            "作者", "订单数", "售出件数", "赠品件数", "原价销售额", "分摊优惠", "分账金额",
+        ]]
+        for row in stats["authors"]:
+            output.append([
+                row["author"],
+                row["order_count"],
+                row["sold_quantity"],
+                row["gift_quantity"],
+                row["gross_sales"],
+                row["discount_share"],
+                row["net_sales"],
+            ])
+        text_lines = [",".join(csv_escape(value) for value in row) for row in output]
+        data = ("\ufeff" + "\r\n".join(text_lines)).encode("utf-8")
+        scope = order_date or "all"
+        filename = f"booth-author-summary-{scope}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+def csv_escape(value) -> str:
+    text = "" if value is None else str(value)
+    if any(ch in text for ch in [",", '"', "\n", "\r"]):
+        return '"' + text.replace('"', '""') + '"'
+    return text
+
+
+class BoothServer(ThreadingHTTPServer):
+    request_queue_size = 128
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def main() -> None:
+    init_db()
+    server = BoothServer((HOST, PORT), BoothHandler)
+    print(f"漫展摆摊工具已启动： http://127.0.0.1:{PORT}")
+    print(f"后台入口： http://127.0.0.1:{PORT}{ADMIN_PATH}")
+    print("第一次使用请进入后台修改默认密码。")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止。")
+
+
+if __name__ == "__main__":
+    main()
