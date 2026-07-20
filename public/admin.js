@@ -17,6 +17,8 @@ const adminState = {
   productFilter: "all",
   productAuthorFilter: "",
   selectedProductIds: new Set(),
+  loadingAll: false,
+  loadingOrders: false,
   staffName: localStorage.getItem("booth_staff_name") || "",
 };
 
@@ -53,14 +55,48 @@ function uniqueSorted(values) {
     .sort((a, b) => a.localeCompare(b, "zh-CN"));
 }
 
-async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-    ...options,
-  });
-  const data = await res.json();
+async function api(path, options = {}, attempt = 0) {
+  const method = String(options.method || "GET").toUpperCase();
+  const isMutation = method !== "GET";
+  let res;
+  try {
+    res = await fetch(path, {
+      cache: "no-store",
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      ...options,
+    });
+  } catch (error) {
+    if (!isMutation && attempt < 2) {
+      await new Promise((resolve) => setTimeout(resolve, 300 * (attempt + 1)));
+      return api(path, options, attempt + 1);
+    }
+    throw new Error("网络连接不稳定，请稍后重试");
+  }
+  const raw = await res.text();
+  let data = {};
+  if (raw.trim()) {
+    try {
+      data = JSON.parse(raw);
+    } catch (error) {
+      if (!isMutation && attempt < 2 && (res.ok || res.status >= 500)) {
+        await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+        return api(path, options, attempt + 1);
+      }
+      if (!(res.ok && isMutation)) throw new Error("服务器返回内容不完整，请刷新后重试");
+    }
+  } else if (!(res.ok && isMutation)) {
+    if (!isMutation && attempt < 2 && (res.ok || res.status >= 500)) {
+      await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+      return api(path, options, attempt + 1);
+    }
+    throw new Error("服务器没有返回内容，请刷新后重试");
+  }
+  if (!res.ok && !isMutation && attempt < 2 && (res.status === 429 || res.status >= 500)) {
+    await new Promise((resolve) => setTimeout(resolve, 500 * (attempt + 1)));
+    return api(path, options, attempt + 1);
+  }
   if (!res.ok) {
-    const error = new Error(data.error || "操作失败");
+    const error = new Error(data.error || (res.status >= 500 ? "服务器暂时繁忙，请稍后重试" : "操作失败"));
     error.status = res.status;
     error.data = data;
     throw error;
@@ -163,18 +199,115 @@ function updateStaffBadge() {
   if (badge) badge.textContent = `当前摊员：${currentStaffName()}`;
 }
 
-function fileToDataUrl(input) {
+function readFileAsDataUrl(file) {
   return new Promise((resolve, reject) => {
-    const file = input.files && input.files[0];
-    if (!file) return resolve("");
-    if (file.size > 1024 * 1024) {
-      showAdminToast("图片超过 1MB，建议压缩后再上传");
-    }
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result);
     reader.onerror = () => reject(new Error("图片读取失败"));
     reader.readAsDataURL(file);
   });
+}
+
+function dataUrlByteLength(value) {
+  const encoded = String(value || "").split(",", 2)[1] || "";
+  return Math.ceil(encoded.length * 0.75);
+}
+
+function imageFromDataUrl(value) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("图片格式无法读取"));
+    image.src = value;
+  });
+}
+
+async function compressImageDataUrl(value, targetBytes = 850 * 1024, maxDimension = 1600) {
+  const image = await imageFromDataUrl(value);
+  const initialScale = Math.min(1, maxDimension / Math.max(image.naturalWidth, image.naturalHeight));
+  let width = Math.max(1, Math.round(image.naturalWidth * initialScale));
+  let height = Math.max(1, Math.round(image.naturalHeight * initialScale));
+  let quality = 0.86;
+  let best = value;
+  for (let attempt = 0; attempt < 7; attempt += 1) {
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(image, 0, 0, width, height);
+    const compressed = canvas.toDataURL("image/webp", quality);
+    if (dataUrlByteLength(compressed) < dataUrlByteLength(best)) best = compressed;
+    if (dataUrlByteLength(best) <= targetBytes) break;
+    if (quality > 0.62) {
+      quality -= 0.08;
+    } else {
+      width = Math.max(1, Math.round(width * 0.82));
+      height = Math.max(1, Math.round(height * 0.82));
+    }
+  }
+  return best;
+}
+
+async function fileToDataUrl(input) {
+  const file = input.files && input.files[0];
+  if (!file) return "";
+  const original = await readFileAsDataUrl(file);
+  if (file.size <= 1024 * 1024) return original;
+  const compressed = await compressImageDataUrl(original);
+  showAdminToast(`图片已自动压缩为 ${Math.ceil(dataUrlByteLength(compressed) / 1024)}KB`);
+  return compressed;
+}
+
+async function mediaUrlToDataUrl(url) {
+  const response = await fetch(url, { cache: "no-store" });
+  if (!response.ok) throw new Error("图片下载失败");
+  const blob = await response.blob();
+  return { dataUrl: await readFileAsDataUrl(blob), size: blob.size };
+}
+
+function productPayload(product, image = product.image || "") {
+  return {
+    name: product.name,
+    price: Number(product.price),
+    stock: Number(product.stock),
+    low_stock_threshold: Number(product.low_stock_threshold ?? 3),
+    category: product.category || "",
+    author: product.author || "",
+    tags: product.tags || "",
+    image,
+    is_gift: Boolean(product.is_gift),
+    active: Boolean(product.active),
+  };
+}
+
+async function optimizeExistingImages(button) {
+  if (!confirm("将现有大图压缩为网页展示尺寸。请自行保留原图，确定继续吗？")) return;
+  button.disabled = true;
+  const originalText = button.textContent;
+  let optimized = 0;
+  try {
+    const productsWithImages = adminState.products.filter((product) => product.image);
+    for (let index = 0; index < productsWithImages.length; index += 1) {
+      const product = productsWithImages[index];
+      button.textContent = `正在处理 ${index + 1}/${productsWithImages.length}`;
+      const source = await mediaUrlToDataUrl(product.image);
+      if (source.size <= 550 * 1024) continue;
+      const compressed = await compressImageDataUrl(source.dataUrl, 500 * 1024, 1400);
+      if (dataUrlByteLength(compressed) >= source.size) continue;
+      await api(`/api/admin/products/${product.id}`, {
+        method: "PATCH",
+        body: JSON.stringify(productPayload(product, compressed)),
+      });
+      optimized += 1;
+    }
+    showAdminToast(optimized ? `已压缩 ${optimized} 张大图` : "现有图片已经适合网页展示");
+    await loadAll(false);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
 }
 
 function beep() {
@@ -233,7 +366,8 @@ async function loadLoginStaffChoices() {
   } catch (error) {
     select.hidden = true;
     input.hidden = false;
-    input.value = "摊主";
+    input.value = localStorage.getItem("booth_staff_name") || "";
+    input.placeholder = "请输入已设置的摊员名字";
   }
 }
 
@@ -336,6 +470,7 @@ function mountAdminView() {
             <select id="productAuthorFilter">
               <option value="">全部作者</option>
             </select>
+            <button id="optimizeProductImages" class="ghost-btn" type="button">压缩现有图片</button>
             <button id="bulkDeleteProducts" class="ghost-btn danger-action" type="button" disabled>批量删除</button>
             <span id="productBulkState" class="bulk-state">已选 0 个</span>
           </div>
@@ -640,7 +775,7 @@ function renderProducts() {
           <div class="product-tag-row">${productTagsMarkup(product.tags)}</div>
           <p>${money(product.price)} · 库存 ${product.stock} · ${product.is_gift ? "不可购买" : (product.active ? "上架" : "下架")}</p>
         </div>
-        ${product.image ? `<img src="${product.image}" alt="${escapeHtml(product.name)}">` : ""}
+        ${product.image ? `<img src="${product.image}" alt="${escapeHtml(product.name)}" loading="lazy" decoding="async">` : ""}
       </div>
       <div class="admin-product-actions">
         <button class="ghost-btn" data-copy-product="${product.id}">复制新增</button>
@@ -1068,28 +1203,49 @@ function renderSettings(force = false) {
   if (!adminState.promotionsDirty || force) renderPromotions();
 }
 
-async function loadAll(playNotice = true) {
-  adminState.orderDate = new Date().toISOString().slice(0, 10);
-  const dateQuery = `?date=${encodeURIComponent(adminState.orderDate)}`;
-  const [orders, products, settings] = await Promise.all([
-    api(`/api/admin/orders${dateQuery}`),
-    api("/api/admin/products"),
-    api("/api/admin/settings"),
-  ]);
+function applyLoadedOrders(orders, playNotice) {
   const newest = orders.reduce((max, order) => Math.max(max, order.id), 0);
   const oldLast = adminState.lastOrderId;
   adminState.orders = orders;
-  adminState.products = products;
-  adminState.settings = settings;
-  normalizeCurrentStaff();
   renderOrders();
-  renderProducts();
-  renderSettings(false);
   if (playNotice && oldLast && newest > oldLast) {
     const newOrder = orders.find((order) => order.id === newest);
     if (newOrder) notify(newOrder);
   }
   adminState.lastOrderId = Math.max(adminState.lastOrderId, newest);
+}
+
+async function loadOrders(playNotice = true) {
+  if (adminState.loadingAll || adminState.loadingOrders) return;
+  adminState.loadingOrders = true;
+  try {
+    adminState.orderDate = localDateString();
+    const dateQuery = `?date=${encodeURIComponent(adminState.orderDate)}`;
+    const orders = await api(`/api/admin/orders${dateQuery}`);
+    applyLoadedOrders(orders, playNotice);
+  } finally {
+    adminState.loadingOrders = false;
+  }
+}
+
+async function loadAll(playNotice = true) {
+  if (adminState.loadingAll) return;
+  adminState.loadingAll = true;
+  try {
+    adminState.orderDate = localDateString();
+    const dateQuery = `?date=${encodeURIComponent(adminState.orderDate)}`;
+    const orders = await api(`/api/admin/orders${dateQuery}`);
+    const products = await api("/api/admin/products");
+    const settings = await api("/api/admin/settings");
+    adminState.products = products;
+    adminState.settings = settings;
+    normalizeCurrentStaff();
+    applyLoadedOrders(orders, playNotice);
+    renderProducts();
+    renderSettings(false);
+  } finally {
+    adminState.loadingAll = false;
+  }
 }
 
 async function loadSales() {
@@ -1172,11 +1328,11 @@ async function saveStaffMembers(members) {
       seen.add(name);
     }
   }
-  const settings = await api("/api/admin/settings", {
+  await api("/api/admin/settings", {
     method: "POST",
     body: JSON.stringify({ staff_members: JSON.stringify(clean) }),
   });
-  adminState.settings = settings;
+  adminState.settings = { ...adminState.settings, staff_members: JSON.stringify(clean) };
   if (clean.length && !clean.includes(currentStaffName())) {
     adminState.staffName = clean[0];
     localStorage.setItem("booth_staff_name", adminState.staffName);
@@ -1217,11 +1373,11 @@ function currentPromotionDraft() {
 
 async function savePromotions() {
   const next = collectPromotions();
-  const settings = await api("/api/admin/settings", {
+  await api("/api/admin/settings", {
     method: "POST",
     body: JSON.stringify({ promotions: JSON.stringify(next) }),
   });
-  adminState.settings = settings;
+  adminState.settings = { ...adminState.settings, promotions: JSON.stringify(next) };
   adminState.promotionsDirty = false;
   renderPromotions();
   showAdminToast("促销规则已保存");
@@ -1256,7 +1412,7 @@ async function updateOrder(id, field, value, extra = {}) {
   const payload = field === "status" ? { order_status: value } : { payment_status: value };
   Object.assign(payload, extra);
   await api(`/api/admin/orders/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
-  await loadAll(false);
+  await loadOrders(false);
 }
 
 async function claimOrder(id) {
@@ -1266,7 +1422,7 @@ async function claimOrder(id) {
   } catch (error) {
     if (error.status === 409) {
       showAdminToast(error.message);
-      await loadAll(false);
+      await loadOrders(false);
       return;
     }
     throw error;
@@ -1285,7 +1441,7 @@ async function releaseOrder(id) {
     body: JSON.stringify({ picker_name: "" }),
   });
   showAdminToast("已释放拣货");
-  await loadAll(false);
+  await loadOrders(false);
 }
 
 async function togglePicked(itemId, picked) {
@@ -1293,7 +1449,7 @@ async function togglePicked(itemId, picked) {
     method: "PATCH",
     body: JSON.stringify({ picked }),
   });
-  await loadAll(false);
+  await loadOrders(false);
 }
 
 document.querySelector("#loginForm").addEventListener("submit", login);
@@ -1346,6 +1502,9 @@ function bindAdminViewEvents() {
   });
   document.querySelector("#bulkDeleteProducts").addEventListener("click", () => {
     deleteSelectedProducts().catch((error) => alert(error.message));
+  });
+  document.querySelector("#optimizeProductImages").addEventListener("click", (event) => {
+    optimizeExistingImages(event.currentTarget).catch((error) => alert(error.message));
   });
   document.querySelector("#soundToggle").addEventListener("click", (event) => {
     unlockAudio();
@@ -1491,7 +1650,7 @@ document.addEventListener("click", async (event) => {
 
 setInterval(() => {
   const adminView = document.querySelector("#adminView");
-  if (adminView) loadAll(true).catch(console.error);
+  if (adminView) loadOrders(true).catch(console.error);
 }, 5000);
 
 document.querySelector("#loginView").hidden = false;
