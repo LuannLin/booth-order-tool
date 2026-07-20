@@ -137,7 +137,19 @@ def init_db() -> None:
             conn.execute("ALTER TABLE order_items ADD COLUMN item_type TEXT NOT NULL DEFAULT 'sale'")
         if "promotion_name" not in item_columns:
             conn.execute("ALTER TABLE order_items ADD COLUMN promotion_name TEXT NOT NULL DEFAULT ''")
+        if "author" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN author TEXT NOT NULL DEFAULT ''")
+        if "category" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+        if "tags" not in item_columns:
+            conn.execute("ALTER TABLE order_items ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
         product_columns = {row["name"] for row in conn.execute("PRAGMA table_info(products)").fetchall()}
+        if "category" not in product_columns:
+            conn.execute("ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+        if "author" not in product_columns:
+            conn.execute("ALTER TABLE products ADD COLUMN author TEXT NOT NULL DEFAULT ''")
+        if "tags" not in product_columns:
+            conn.execute("ALTER TABLE products ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
         if "is_gift" not in product_columns:
             conn.execute("ALTER TABLE products ADD COLUMN is_gift INTEGER NOT NULL DEFAULT 0")
         if "low_stock_threshold" not in product_columns:
@@ -431,11 +443,82 @@ def sales_stats(conn: sqlite3.Connection, order_date: str = "") -> dict:
         """,
         params,
     ).fetchall()
+    author_rows = conn.execute(
+        f"""
+        SELECT
+            o.id AS order_id,
+            o.discount_total,
+            oi.author,
+            oi.item_type,
+            oi.price,
+            oi.quantity
+        FROM order_items oi
+        JOIN orders o ON o.id = oi.order_id
+        {where}
+        ORDER BY o.id, oi.id
+        """,
+        params,
+    ).fetchall()
+    rows_by_order: dict[int, list[sqlite3.Row]] = {}
+    discounts_by_order: dict[int, float] = {}
+    for row in author_rows:
+        order_id = int(row["order_id"])
+        rows_by_order.setdefault(order_id, []).append(row)
+        discounts_by_order[order_id] = float(row["discount_total"] or 0)
+
+    author_map: dict[str, dict] = {}
+    for order_id, rows in rows_by_order.items():
+        sale_gross_total = sum(
+            round(float(row["price"] or 0) * int(row["quantity"] or 0), 2)
+            for row in rows
+            if row["item_type"] != "gift" and float(row["price"] or 0) > 0
+        )
+        discount_total = min(round(float(discounts_by_order.get(order_id, 0)), 2), sale_gross_total)
+        touched_authors: set[str] = set()
+        for row in rows:
+            author = str(row["author"] or "").strip() or "未填作者"
+            data = author_map.setdefault(author, {
+                "author": author,
+                "order_ids": set(),
+                "sold_quantity": 0,
+                "gift_quantity": 0,
+                "gross_sales": 0.0,
+                "discount_share": 0.0,
+                "net_sales": 0.0,
+            })
+            quantity = int(row["quantity"] or 0)
+            line_gross = round(float(row["price"] or 0) * quantity, 2)
+            if row["item_type"] == "gift":
+                data["gift_quantity"] += quantity
+            else:
+                data["sold_quantity"] += quantity
+                data["gross_sales"] += line_gross
+                if sale_gross_total > 0 and line_gross > 0 and discount_total > 0:
+                    data["discount_share"] += discount_total * line_gross / sale_gross_total
+            touched_authors.add(author)
+        for author in touched_authors:
+            author_map[author]["order_ids"].add(order_id)
+
+    author_stats = []
+    for data in author_map.values():
+        gross_sales = round(data["gross_sales"], 2)
+        discount_share = round(data["discount_share"], 2)
+        author_stats.append({
+            "author": data["author"],
+            "order_count": len(data["order_ids"]),
+            "sold_quantity": data["sold_quantity"],
+            "gift_quantity": data["gift_quantity"],
+            "gross_sales": gross_sales,
+            "discount_share": discount_share,
+            "net_sales": round(max(0.0, gross_sales - discount_share), 2),
+        })
+    author_stats.sort(key=lambda row: (-row["net_sales"], -row["sold_quantity"], row["author"]))
     return {
         "order_count": totals["order_count"],
         "sold_quantity": totals["sold_quantity"],
         "sales_total": revenue["sales_total"],
         "products": [dict(row) for row in products],
+        "authors": author_stats,
         "orders": list_orders(conn, order_date=order_date),
     }
 
@@ -519,6 +602,12 @@ class BoothHandler(BaseHTTPRequestHandler):
             if not require_admin(self):
                 return
             return self.export_summary_csv()
+        if path == "/api/admin/export-authors":
+            if not require_admin(self):
+                return
+            query = parse_qs(parsed.query)
+            order_date = query.get("date", [""])[0]
+            return self.export_author_csv(order_date=order_date)
         write_json(self, 404, {"error": "没有找到这个页面"})
 
     def do_POST(self) -> None:
@@ -1103,13 +1192,40 @@ class BoothHandler(BaseHTTPRequestHandler):
                     ) AS sales_total
                 """
             ).fetchone()
-        output = [["商品名", "作者", "分类", "标签", "单价", "销量", "营业额"]]
+        output = [["商品名", "作者", "分类", "标签", "类型", "单价", "销量", "营业额"]]
         for row in rows:
             output.append([row[key] for key in row.keys()])
-        output.append(["总计", "", "", "", "", total["sold_quantity"], total["sales_total"]])
+        output.append(["总计", "", "", "", "", "", total["sold_quantity"], total["sales_total"]])
         text_lines = [",".join(csv_escape(value) for value in row) for row in output]
         data = ("\ufeff" + "\r\n".join(text_lines)).encode("utf-8")
         filename = f"booth-summary-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def export_author_csv(self, order_date: str = "") -> None:
+        with DB_LOCK, connect() as conn:
+            stats = sales_stats(conn, order_date=order_date)
+        output = [[
+            "作者", "订单数", "售出件数", "赠品件数", "原价销售额", "分摊优惠", "分账金额",
+        ]]
+        for row in stats["authors"]:
+            output.append([
+                row["author"],
+                row["order_count"],
+                row["sold_quantity"],
+                row["gift_quantity"],
+                row["gross_sales"],
+                row["discount_share"],
+                row["net_sales"],
+            ])
+        text_lines = [",".join(csv_escape(value) for value in row) for row in output]
+        data = ("\ufeff" + "\r\n".join(text_lines)).encode("utf-8")
+        scope = order_date or "all"
+        filename = f"booth-author-summary-{scope}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
         self.send_response(200)
         self.send_header("Content-Type", "text/csv; charset=utf-8")
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
