@@ -11,8 +11,12 @@ const adminState = {
   promotionsDirty: false,
   audioContext: null,
   orderDate: "",
-  salesDate: "",
+  salesDate: localDateString(),
   sales: null,
+  productSearch: "",
+  productFilter: "all",
+  productAuthorFilter: "",
+  selectedProductIds: new Set(),
   staffName: localStorage.getItem("booth_staff_name") || "",
 };
 
@@ -22,6 +26,11 @@ const payText = { pending: "待核验", verified: "已核验", cash_pending: "�
 const methodText = { wechat: "微信", alipay: "支付宝", cash: "现金" };
 const receiveText = { now: "现在领取", later: "稍后领取" };
 
+function localDateString(date = new Date()) {
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>"']/g, (char) => ({
     "&": "&amp;",
@@ -30,6 +39,18 @@ function escapeHtml(value = "") {
     "\"": "&quot;",
     "'": "&#39;",
   }[char]));
+}
+
+function splitTags(value = "") {
+  return String(value)
+    .split(/[,，、]/)
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+}
+
+function uniqueSorted(values) {
+  return [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b, "zh-CN"));
 }
 
 async function api(path, options = {}) {
@@ -146,6 +167,9 @@ function fileToDataUrl(input) {
   return new Promise((resolve, reject) => {
     const file = input.files && input.files[0];
     if (!file) return resolve("");
+    if (file.size > 1024 * 1024) {
+      showAdminToast("图片超过 1MB，建议压缩后再上传");
+    }
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result);
     reader.onerror = () => reject(new Error("图片读取失败"));
@@ -286,15 +310,36 @@ function mountAdminView() {
             <label>价格<input id="productPrice" type="number" min="0" step="0.01" required></label>
             <label>库存<input id="productStock" type="number" min="0" step="1" required></label>
             <label>分类<input id="productCategory" placeholder="徽章 / 纸品 / 套组"></label>
-            <label>作者<input id="productAuthor" placeholder="合摊成员名"></label>
-            <label>标签<input id="productTags" placeholder="作品、角色、属性，用逗号隔开"></label>
-            <label>图片<input id="productImage" type="file" accept="image/*"></label>
+            <label>作者 / 合摊成员<input id="productAuthor" list="authorOptions" placeholder="用于分账统计"></label>
+            <datalist id="authorOptions"></datalist>
+            <label class="wide-field">标签<input id="productTags" placeholder="作品、角色、属性，用逗号隔开"></label>
+            <div id="tagSuggestions" class="tag-suggestions"></div>
+            <label class="wide-field">图片
+              <input id="productImage" type="file" accept="image/*">
+              <span class="form-hint">建议上传实体图，尽量压缩到 1MB 以内。</span>
+            </label>
             <label class="check-row"><input id="productActive" type="checkbox" checked> 上架</label>
             <button class="primary-btn" type="submit">保存商品</button>
             <button id="resetProduct" class="ghost-btn" type="button">清空表单</button>
           </form>
           <div class="list-heading"><h2>商品列表</h2></div>
-          <div id="productList" class="admin-list"></div>
+          <div class="product-toolbar">
+            <input id="productSearch" type="search" placeholder="搜索商品名、作者、分类或标签">
+            <select id="productFilter">
+              <option value="all">全部商品</option>
+              <option value="active">在售</option>
+              <option value="low">低库存</option>
+              <option value="soldout">售罄</option>
+              <option value="gift">赠品</option>
+              <option value="hidden">已下架</option>
+            </select>
+            <select id="productAuthorFilter">
+              <option value="">全部作者</option>
+            </select>
+            <button id="bulkDeleteProducts" class="ghost-btn danger-action" type="button" disabled>批量删除</button>
+            <span id="productBulkState" class="bulk-state">已选 0 个</span>
+          </div>
+          <div id="productList" class="admin-list product-management-list"></div>
         </section>
 
         <section id="settingsTab" class="tab-panel" hidden>
@@ -333,7 +378,7 @@ function mountAdminView() {
               <h2>销售情况</h2>
             </div>
           </div>
-          <div class="board-actions">
+          <div class="board-actions sales-toolbar">
             <label class="date-filter">销售日期
               <input id="salesDateInput" type="date">
             </label>
@@ -341,15 +386,35 @@ function mountAdminView() {
             <button id="todaySales" class="ghost-btn" type="button">今天</button>
             <a class="ghost-link" href="/api/admin/export">导出订单明细</a>
             <a class="ghost-link" href="/api/admin/export-summary">导出商品汇总</a>
+            <a id="authorExportLink" class="ghost-link" href="/api/admin/export-authors">导出作者分账</a>
+            <span id="salesScopeLabel" class="sales-scope">今天</span>
           </div>
           <div class="sales-summary">
             <div><span>订单数</span><strong id="salesOrderCount">0</strong></div>
             <div><span>售出件数</span><strong id="salesQuantity">0</strong></div>
             <div><span>营业总额</span><strong id="salesTotal">¥0.00</strong></div>
           </div>
-          <div id="salesProductList" class="admin-list"></div>
-          <h2 class="sales-section-title">订单明细</h2>
-          <div id="salesOrderList" class="admin-list"></div>
+          <section class="sales-data-section">
+            <div class="sales-section-heading">
+              <span class="section-kicker">合摊结算</span>
+              <h2>作者分账</h2>
+            </div>
+            <div id="salesAuthorList" class="author-sales-list"></div>
+          </section>
+          <section class="sales-data-section">
+            <div class="sales-section-heading">
+              <span class="section-kicker">制品汇总</span>
+              <h2>单制品销量统计</h2>
+            </div>
+            <div id="salesProductList" class="sales-product-list"></div>
+          </section>
+          <section class="sales-data-section sales-orders-section">
+            <div class="sales-section-heading">
+              <span class="section-kicker">逐单核对</span>
+              <h2>订单明细</h2>
+            </div>
+            <div id="salesOrderList" class="sales-order-list"></div>
+          </section>
         </section>
       </main>
     </section>
@@ -553,26 +618,97 @@ function renderOrders() {
 
 function renderProducts() {
   const list = document.querySelector("#productList");
-  list.innerHTML = adminState.products.map((product) => {
+  if (!list) return;
+  renderProductTools();
+  const visibleProducts = filteredProducts();
+  list.innerHTML = visibleProducts.map((product) => {
     const giftEmpty = product.is_gift && Number(product.stock || 0) <= 0;
+    const lowStock = !product.is_gift && product.active && Number(product.stock || 0) > 0 && Number(product.stock || 0) <= Number(product.low_stock_threshold ?? 3);
+    const selected = adminState.selectedProductIds.has(product.id);
     return `
     <article class="admin-product ${giftEmpty ? "gift-empty" : ""}">
       <div class="product-admin-row">
+        <label class="product-select" title="选择商品">
+          <input type="checkbox" data-select-product="${product.id}" ${selected ? "checked" : ""}>
+        </label>
         <div>
-          <strong>${escapeHtml(product.name)}${product.is_gift ? giftBadge() : ""}${giftEmpty ? `<span class="stock-alert-badge">赠品已送完</span>` : ""}</strong>
-          <div class="order-meta">${escapeHtml(product.category || "未分类")} · ${escapeHtml(product.author || "未填作者")}</div>
-          <div class="order-meta">${escapeHtml(product.tags || "无标签")}</div>
+          <strong>${escapeHtml(product.name)}${product.is_gift ? giftBadge() : ""}${giftEmpty ? `<span class="stock-alert-badge">赠品已送完</span>` : ""}${lowStock ? `<span class="badge warn">低库存</span>` : ""}</strong>
+          <div class="product-author-line">
+            <span class="author-pill">作者：${escapeHtml(product.author || "未填作者")}</span>
+            <span class="badge">${escapeHtml(product.category || "未分类")}</span>
+          </div>
+          <div class="product-tag-row">${productTagsMarkup(product.tags)}</div>
           <p>${money(product.price)} · 库存 ${product.stock} · ${product.is_gift ? "不可购买" : (product.active ? "上架" : "下架")}</p>
         </div>
         ${product.image ? `<img src="${product.image}" alt="${escapeHtml(product.name)}">` : ""}
       </div>
       <div class="admin-product-actions">
+        <button class="ghost-btn" data-copy-product="${product.id}">复制新增</button>
         <button class="ghost-btn" data-edit-product="${product.id}">编辑</button>
-        <button class="ghost-btn" data-delete-product="${product.id}">删除</button>
+        <button class="ghost-btn danger-text" data-delete-product="${product.id}">删除</button>
       </div>
     </article>
   `;
-  }).join("") || `<p class="small-muted">还没有商品</p>`;
+  }).join("") || `<p class="small-muted">没有找到符合条件的商品</p>`;
+}
+
+function salesScopeText() {
+  return adminState.salesDate ? `${adminState.salesDate} 订单` : "全部历史订单";
+}
+
+function orderDateKey(order) {
+  return String(order.created_at || "").slice(0, 10) || "未记录日期";
+}
+
+function salesOrderCard(order) {
+  const paid = ["verified", "cash_received"].includes(order.payment_status);
+  const contact = order.receive_type === "later"
+    ? `电话 ${escapeHtml(order.phone || "未填")}`
+    : `尾号 ${escapeHtml(order.phone_tail || "未填")}`;
+  return `
+    <article class="sales-order-card">
+      <div class="order-code-row">
+        <div>
+          <div class="order-code">${escapeHtml(order.pickup_code)}</div>
+          <div class="sales-order-badges">
+            <span class="badge">${statusText[order.order_status] || order.order_status}</span>
+            <span class="badge ${paid ? "ok" : "warn"}">${payText[order.payment_status] || order.payment_status}</span>
+          </div>
+        </div>
+        <strong class="sales-order-total">${money(order.total)}</strong>
+      </div>
+      <div class="sales-order-facts">
+        <span>${escapeHtml(order.created_at)}</span>
+        <span>${receiveText[order.receive_type]} · ${methodText[order.payment_method]}</span>
+        <span>${contact}</span>
+        ${order.pickup_time ? `<span>预计领取 ${escapeHtml(order.pickup_time)}</span>` : ""}
+      </div>
+      <ol class="sales-order-items">${order.items.map((item) => `<li>${orderItemLine(item)}</li>`).join("")}</ol>
+    </article>
+  `;
+}
+
+function renderSalesOrders(orderList, orders) {
+  if (!orders.length) {
+    orderList.innerHTML = `<p class="small-muted">这个范围内还没有订单</p>`;
+    return;
+  }
+  if (adminState.salesDate) {
+    orderList.innerHTML = `<div class="sales-order-grid">${orders.map(salesOrderCard).join("")}</div>`;
+    return;
+  }
+  const groups = new Map();
+  orders.forEach((order) => {
+    const key = orderDateKey(order);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(order);
+  });
+  orderList.innerHTML = [...groups.entries()].map(([date, dayOrders]) => `
+    <section class="sales-date-group">
+      <h3>${escapeHtml(date)}<span>${dayOrders.length} 单</span></h3>
+      <div class="sales-order-grid">${dayOrders.map(salesOrderCard).join("")}</div>
+    </section>
+  `).join("");
 }
 
 function renderSales() {
@@ -580,33 +716,45 @@ function renderSales() {
   document.querySelector("#salesOrderCount").textContent = adminState.sales.order_count;
   document.querySelector("#salesQuantity").textContent = adminState.sales.sold_quantity;
   document.querySelector("#salesTotal").textContent = money(adminState.sales.sales_total);
+  document.querySelector("#salesDateInput").value = adminState.salesDate;
+  document.querySelector("#salesScopeLabel").textContent = salesScopeText();
+  const exportQuery = adminState.salesDate ? `?date=${encodeURIComponent(adminState.salesDate)}` : "";
+  document.querySelector("#authorExportLink").href = `/api/admin/export-authors${exportQuery}`;
+
+  const authorList = document.querySelector("#salesAuthorList");
+  authorList.innerHTML = (adminState.sales.authors || []).map((author) => `
+    <article class="author-share-card">
+      <div>
+        <strong>${escapeHtml(author.author)}</strong>
+        <span>${author.order_count} 单 · 售出 ${author.sold_quantity} 件 · 赠品 ${author.gift_quantity} 件</span>
+      </div>
+      <dl>
+        <div><dt>原价</dt><dd>${money(author.gross_sales)}</dd></div>
+        <div><dt>分摊优惠</dt><dd>- ${money(author.discount_share)}</dd></div>
+        <div><dt>分账金额</dt><dd>${money(author.net_sales)}</dd></div>
+      </dl>
+    </article>
+  `).join("") || `<p class="small-muted">这个范围内还没有作者分账数据</p>`;
+
   const list = document.querySelector("#salesProductList");
   list.innerHTML = adminState.sales.products.map((product) => `
-    <article class="admin-product">
-      <div class="product-admin-row">
-        <div>
-          <strong>${escapeHtml(product.name)}${isGiftItem(product) ? giftBadge() : ""}</strong>
-          <div class="order-meta">${escapeHtml(product.category || "未分类")} · ${escapeHtml(product.author || "未填作者")}</div>
-          <p>${money(product.price)} · 售出 ${product.sold_quantity} 件 · <strong>${money(product.sales_total)}</strong></p>
+    <article class="sales-product-row">
+      <div class="sales-product-name">
+        <strong>${escapeHtml(product.name)}${isGiftItem(product) ? giftBadge() : ""}</strong>
+        <div class="product-author-line">
+          <span class="author-pill">作者：${escapeHtml(product.author || "未填作者")}</span>
+          <span class="badge">${escapeHtml(product.category || "未分类")}</span>
         </div>
       </div>
+      <dl class="sales-product-metrics">
+        <div><dt>单价</dt><dd>${money(product.price)}</dd></div>
+        <div><dt>${isGiftItem(product) ? "赠出数量" : "售出数量"}</dt><dd>${product.sold_quantity} 件</dd></div>
+        <div><dt>销售额</dt><dd>${money(product.sales_total)}</dd></div>
+      </dl>
     </article>
   `).join("") || `<p class="small-muted">这个范围内还没有销售记录</p>`;
   const orderList = document.querySelector("#salesOrderList");
-  orderList.innerHTML = adminState.sales.orders.map((order) => `
-    <article class="admin-product">
-      <div class="order-code-row">
-        <div>
-          <div class="order-code">${escapeHtml(order.pickup_code)}</div>
-          <div class="order-meta">${escapeHtml(order.created_at)} · ${statusText[order.order_status]} · ${payText[order.payment_status]}</div>
-        </div>
-        <strong>${money(order.total)}</strong>
-      </div>
-      <p class="order-meta">${receiveText[order.receive_type]} · ${methodText[order.payment_method]} · ${order.receive_type === "later" ? `电话 ${escapeHtml(order.phone || "未填")}` : `尾号 ${escapeHtml(order.phone_tail || "未填")}`}</p>
-      ${order.pickup_time ? `<p class="order-meta">预计领取：${escapeHtml(order.pickup_time)}</p>` : ""}
-      <ol class="order-items">${order.items.map((item) => `<li>${orderItemLine(item)}</li>`).join("")}</ol>
-    </article>
-  `).join("") || `<p class="small-muted">这个范围内还没有订单</p>`;
+  renderSalesOrders(orderList, adminState.sales.orders || []);
 }
 
 function fillProductForm(product) {
@@ -622,6 +770,16 @@ function fillProductForm(product) {
   document.querySelector("#productActive").checked = product?.active ?? true;
   document.querySelector("#productImage").value = "";
   adminState.editingImage = product?.image || "";
+}
+
+function copyProductToForm(product) {
+  fillProductForm(product);
+  document.querySelector("#productId").value = "";
+  const nameInput = document.querySelector("#productName");
+  window.scrollTo({ top: 0, behavior: "smooth" });
+  nameInput.focus();
+  nameInput.select();
+  showAdminToast("制品信息已复制，修改名称后保存即可新增");
 }
 
 function renderStaffManager() {
@@ -645,6 +803,78 @@ function isGiftItem(item) {
 
 function giftBadge() {
   return `<span class="gift-badge">赠品</span>`;
+}
+
+function productTagsMarkup(tags) {
+  const values = splitTags(tags);
+  if (!values.length) return `<span class="small-muted">无标签</span>`;
+  return values.map((tag) => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("");
+}
+
+function productMatchesFilter(product) {
+  const search = adminState.productSearch.trim().toLowerCase();
+  if (search) {
+    const haystack = [product.name, product.author, product.category, product.tags]
+      .map((value) => String(value || "").toLowerCase())
+      .join(" ");
+    if (!haystack.includes(search)) return false;
+  }
+  if (adminState.productAuthorFilter && product.author !== adminState.productAuthorFilter) return false;
+  const stock = Number(product.stock || 0);
+  const low = Number(product.low_stock_threshold ?? 3);
+  if (adminState.productFilter === "active") return product.active && !product.is_gift;
+  if (adminState.productFilter === "low") return product.active && !product.is_gift && stock > 0 && stock <= low;
+  if (adminState.productFilter === "soldout") return stock <= 0;
+  if (adminState.productFilter === "gift") return Boolean(product.is_gift);
+  if (adminState.productFilter === "hidden") return !product.active;
+  return true;
+}
+
+function filteredProducts() {
+  return adminState.products.filter(productMatchesFilter);
+}
+
+function renderProductTools() {
+  const search = document.querySelector("#productSearch");
+  const filter = document.querySelector("#productFilter");
+  const authorFilter = document.querySelector("#productAuthorFilter");
+  const bulkState = document.querySelector("#productBulkState");
+  const bulkButton = document.querySelector("#bulkDeleteProducts");
+  const authorOptions = document.querySelector("#authorOptions");
+  if (!search || !filter || !authorFilter) return;
+
+  search.value = adminState.productSearch;
+  filter.value = adminState.productFilter;
+  const authors = uniqueSorted(adminState.products.map((product) => product.author));
+  authorFilter.innerHTML = `<option value="">全部作者</option>${authors.map((author) => (
+    `<option value="${escapeHtml(author)}" ${adminState.productAuthorFilter === author ? "selected" : ""}>${escapeHtml(author)}</option>`
+  )).join("")}`;
+  if (authorOptions) {
+    authorOptions.innerHTML = authors.map((author) => `<option value="${escapeHtml(author)}"></option>`).join("");
+  }
+  const validIds = new Set(adminState.products.map((product) => product.id));
+  adminState.selectedProductIds = new Set([...adminState.selectedProductIds].filter((id) => validIds.has(id)));
+  if (bulkState) bulkState.textContent = `已选 ${adminState.selectedProductIds.size} 个`;
+  if (bulkButton) bulkButton.disabled = adminState.selectedProductIds.size === 0;
+  renderTagSuggestions();
+}
+
+function renderTagSuggestions() {
+  const mount = document.querySelector("#tagSuggestions");
+  if (!mount) return;
+  const tags = uniqueSorted(adminState.products.flatMap((product) => splitTags(product.tags))).slice(0, 28);
+  mount.innerHTML = tags.length
+    ? `<span>常用标签</span>${tags.map((tag) => `<button type="button" data-add-tag="${escapeHtml(tag)}">${escapeHtml(tag)}</button>`).join("")}`
+    : `<span>保存商品后，会在这里显示常用标签。</span>`;
+}
+
+function addTagToForm(tag) {
+  const input = document.querySelector("#productTags");
+  if (!input) return;
+  const tags = splitTags(input.value);
+  if (!tags.includes(tag)) tags.push(tag);
+  input.value = tags.join("，");
+  input.focus();
 }
 
 function promoGiftOptions(selectedId = 0) {
@@ -868,6 +1098,16 @@ async function loadSales() {
   renderSales();
 }
 
+async function deleteSelectedProducts() {
+  const ids = [...adminState.selectedProductIds];
+  if (!ids.length) return;
+  if (!confirm(`确定删除选中的 ${ids.length} 个商品吗？历史订单不会删除，但这些商品会从当前商品列表移除。`)) return;
+  await Promise.all(ids.map((id) => api(`/api/admin/products/${id}`, { method: "DELETE" })));
+  adminState.selectedProductIds.clear();
+  showAdminToast("已批量删除商品");
+  await loadAll(false);
+}
+
 async function saveProduct(event) {
   event.preventDefault();
   try {
@@ -1062,6 +1302,13 @@ document.addEventListener("input", (event) => {
   if (event.target.closest("#promotionEditor")) adminState.promotionsDirty = true;
 });
 document.addEventListener("change", (event) => {
+  const selectedProduct = event.target.closest("[data-select-product]");
+  if (selectedProduct) {
+    const id = Number(selectedProduct.dataset.selectProduct);
+    if (selectedProduct.checked) adminState.selectedProductIds.add(id);
+    else adminState.selectedProductIds.delete(id);
+    renderProducts();
+  }
   if (event.target.closest("#promotionEditor")) adminState.promotionsDirty = true;
   if (event.target.matches('[data-promo-field="trigger_type"]')) {
     syncPromotionRowVisibility(event.target.closest("[data-promo-row]"));
@@ -1085,6 +1332,21 @@ function bindAdminViewEvents() {
     showAdminToast("摊员已添加");
   });
   document.querySelector("#resetProduct").addEventListener("click", () => fillProductForm(null));
+  document.querySelector("#productSearch").addEventListener("input", (event) => {
+    adminState.productSearch = event.target.value;
+    renderProducts();
+  });
+  document.querySelector("#productFilter").addEventListener("change", (event) => {
+    adminState.productFilter = event.target.value;
+    renderProducts();
+  });
+  document.querySelector("#productAuthorFilter").addEventListener("change", (event) => {
+    adminState.productAuthorFilter = event.target.value;
+    renderProducts();
+  });
+  document.querySelector("#bulkDeleteProducts").addEventListener("click", () => {
+    deleteSelectedProducts().catch((error) => alert(error.message));
+  });
   document.querySelector("#soundToggle").addEventListener("click", (event) => {
     unlockAudio();
     adminState.soundOn = !adminState.soundOn;
@@ -1123,7 +1385,7 @@ function bindAdminViewEvents() {
     await loadSales();
   });
   document.querySelector("#todaySales").addEventListener("click", async () => {
-    adminState.salesDate = new Date().toISOString().slice(0, 10);
+    adminState.salesDate = localDateString();
     document.querySelector("#salesDateInput").value = adminState.salesDate;
     await loadSales();
   });
@@ -1144,6 +1406,7 @@ document.addEventListener("click", async (event) => {
   const transfer = event.target.closest("[data-transfer-order]");
   const release = event.target.closest("[data-release-order]");
   const pickItem = event.target.closest("[data-pick-item]");
+  const copyProduct = event.target.closest("[data-copy-product]");
   const edit = event.target.closest("[data-edit-product]");
   const del = event.target.closest("[data-delete-product]");
   const renameStaff = event.target.closest("[data-rename-staff]");
@@ -1151,7 +1414,9 @@ document.addEventListener("click", async (event) => {
   const addPromo = event.target.closest("[data-add-promo]");
   const removePromo = event.target.closest("[data-remove-promo]");
   const savePromo = event.target.closest("#savePromotions");
+  const addTag = event.target.closest("[data-add-tag]");
   try {
+    if (addTag) addTagToForm(addTag.dataset.addTag);
     if (claim) await claimOrder(claim.dataset.claimOrder);
     if (transfer) await transferOrder(transfer.dataset.transferOrder);
     if (release) await releaseOrder(release.dataset.releaseOrder);
@@ -1172,6 +1437,10 @@ document.addEventListener("click", async (event) => {
     if (pay) {
       const [id, value] = pay.dataset.payStatus.split(":");
       await updateOrder(id, "pay", value);
+    }
+    if (copyProduct) {
+      const product = adminState.products.find((item) => item.id === Number(copyProduct.dataset.copyProduct));
+      if (product) copyProductToForm(product);
     }
     if (edit) {
       const product = adminState.products.find((item) => item.id === Number(edit.dataset.editProduct));
