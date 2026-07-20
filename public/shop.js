@@ -276,7 +276,9 @@ function renderOrder(order) {
       <footer class="receipt-footer">谢谢光临 · 漫展快乐</footer>
     </article>
   `;
-  document.querySelector("#orderDialog").showModal();
+  const dialog = document.querySelector("#orderDialog");
+  dialog.showModal();
+  document.querySelector("#orderResult").scrollTop = 0;
 }
 
 async function submitOrder(event) {
