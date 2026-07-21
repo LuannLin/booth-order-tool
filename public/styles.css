@@ -1389,6 +1389,22 @@ button:disabled,
   box-shadow: var(--shadow-sm);
 }
 
+#productForm {
+  grid-template-columns: minmax(220px, 1.55fr) repeat(3, minmax(120px, 1fr));
+  align-items: start;
+  gap: 14px 12px;
+  padding: 18px;
+}
+
+#productForm > label {
+  min-width: 0;
+}
+
+#productForm input:not([type="checkbox"]),
+#productForm select {
+  min-height: 42px;
+}
+
 .editor-form .primary-btn,
 .editor-form .ghost-btn {
   align-self: end;
@@ -1396,6 +1412,46 @@ button:disabled,
 
 .editor-form .wide-field {
   grid-column: span 2;
+}
+
+#productForm .product-image-field {
+  grid-column: 1 / -1;
+  border-top: 1px solid var(--line);
+  padding-top: 13px;
+}
+
+.product-form-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  padding-top: 13px;
+}
+
+.product-form-flags,
+.product-form-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  align-items: center;
+}
+
+.product-form-flags .check-row {
+  min-height: 40px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--wash);
+  padding: 7px 11px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.product-form-buttons button {
+  min-width: 112px;
 }
 
 .form-hint {
@@ -1427,7 +1483,7 @@ button:disabled,
 
 .product-toolbar {
   display: grid;
-  grid-template-columns: minmax(260px, 1.4fr) minmax(140px, .7fr) minmax(140px, .7fr) auto auto;
+  grid-template-columns: minmax(260px, 1.4fr) minmax(140px, .7fr) minmax(140px, .7fr) auto;
   gap: 9px;
   align-items: center;
   margin-bottom: 16px;
@@ -1436,6 +1492,42 @@ button:disabled,
   background: var(--paper);
   padding: 12px;
   box-shadow: var(--shadow-sm);
+}
+
+.product-bulk-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  border-top: 1px solid var(--line);
+  padding-top: 11px;
+}
+
+.select-all-products {
+  display: inline-flex;
+  min-height: 38px;
+  align-items: center;
+  gap: 7px;
+  color: var(--ink-soft);
+  font-size: 13px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.select-all-products input {
+  width: 18px;
+  min-height: 18px;
+  accent-color: var(--brand);
+}
+
+.product-bulk-actions .bulk-state {
+  margin-right: auto;
+}
+
+.positive-action {
+  border-color: #a9cec8 !important;
+  color: var(--teal) !important;
 }
 
 .product-toolbar input,
@@ -1773,10 +1865,11 @@ button:disabled,
 }
 
 .sales-toolbar {
-  display: grid;
-  grid-template-columns: minmax(180px, 1fr) repeat(5, max-content);
+  display: flex;
+  flex-wrap: wrap;
   gap: 9px;
-  align-items: end;
+  align-items: center;
+  justify-content: space-between;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--paper);
@@ -1784,10 +1877,25 @@ button:disabled,
   box-shadow: var(--shadow-sm);
 }
 
-.sales-toolbar .sales-scope {
-  grid-column: 1;
-  grid-row: 2;
-  justify-self: start;
+.sales-period-control,
+.sales-toolbar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: end;
+}
+
+.sales-period-control {
+  flex: 0 1 auto;
+}
+
+.sales-toolbar-actions {
+  justify-content: flex-end;
+}
+
+.sales-toolbar .date-filter input {
+  width: 168px;
+  min-width: 0;
 }
 
 .sales-summary {
@@ -2093,18 +2201,16 @@ button:disabled,
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  #productForm {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .product-toolbar {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .sales-toolbar {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
-  .sales-toolbar .sales-scope {
-    grid-column: auto;
-    grid-row: auto;
-    justify-self: stretch;
+  .sales-toolbar-actions {
+    justify-content: flex-start;
   }
 
   .author-share-card {
@@ -2381,23 +2487,25 @@ button:disabled,
   }
 
   .sales-toolbar {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: stretch;
     gap: 8px;
     padding: 10px;
   }
 
-  .sales-toolbar .date-filter,
-  .sales-toolbar .sales-scope {
-    grid-column: 1 / -1;
+  .sales-period-control,
+  .sales-toolbar-actions {
+    width: 100%;
   }
 
-  .sales-toolbar .sales-scope {
-    justify-self: start;
+  .sales-period-control {
+    align-items: end;
+    justify-content: space-between;
   }
 
   .sales-toolbar .ghost-btn,
   .sales-toolbar .ghost-link {
-    min-width: 0;
+    flex: 1 1 calc(50% - 4px);
+    min-width: 120px;
     padding-inline: 8px;
     font-size: 12px;
   }
@@ -2416,7 +2524,8 @@ button:disabled,
 
   #productForm > label:first-of-type,
   #productForm > .wide-field,
-  #productForm > .tag-suggestions {
+  #productForm > .tag-suggestions,
+  #productForm > .product-form-actions {
     grid-column: 1 / -1;
   }
 
@@ -2428,8 +2537,41 @@ button:disabled,
     grid-column: 1 / -1;
   }
 
-  .product-toolbar .bulk-state {
-    justify-self: end;
+  .product-bulk-actions {
+    align-items: stretch;
+  }
+
+  .product-bulk-actions .select-all-products,
+  .product-bulk-actions .bulk-state {
+    flex: 1 1 calc(50% - 4px);
+  }
+
+  .product-bulk-actions .bulk-state {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    margin-right: 0;
+  }
+
+  .product-bulk-actions button {
+    flex: 1 1 calc(33.333% - 6px);
+    min-width: 96px;
+  }
+
+  .product-form-actions,
+  .product-form-flags,
+  .product-form-buttons {
+    align-items: stretch;
+  }
+
+  .product-form-flags,
+  .product-form-buttons {
+    flex: 1 1 100%;
+  }
+
+  .product-form-flags label,
+  .product-form-buttons button {
+    flex: 1 1 calc(50% - 5px);
   }
 
   .admin-list {
