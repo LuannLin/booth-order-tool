@@ -381,7 +381,8 @@ async function checkLogin() {
   const data = await api("/api/admin/me");
   document.querySelector("#loginView").hidden = data.ok;
   if (data.ok) {
-    adminState.staffName = localStorage.getItem("booth_staff_name") || adminState.staffName || "摊主";
+    adminState.staffName = data.staff_name || localStorage.getItem("booth_staff_name") || adminState.staffName || "摊主";
+    localStorage.setItem("booth_staff_name", adminState.staffName);
     mountAdminView();
     await loadAll(false);
   } else {
@@ -438,23 +439,31 @@ function mountAdminView() {
               <h2>商品与库存</h2>
             </div>
           </div>
-          <form id="productForm" class="editor-form">
+          <form id="productForm" class="editor-form product-editor-form">
             <input type="hidden" id="productId">
-            <label>商品名<input id="productName" required></label>
-            <label>价格<input id="productPrice" type="number" min="0" step="0.01" required></label>
-            <label>库存<input id="productStock" type="number" min="0" step="1" required></label>
+            <label class="product-name-field">商品名称<input id="productName" required></label>
+            <label>价格（元）<input id="productPrice" type="number" min="0" step="0.01" required></label>
+            <label>库存数量<input id="productStock" type="number" min="0" step="1" required></label>
+            <label>低库存提醒<input id="productLowStock" type="number" min="0" step="1" value="3"></label>
             <label>分类<input id="productCategory" placeholder="徽章 / 纸品 / 套组"></label>
             <label>作者 / 合摊成员<input id="productAuthor" list="authorOptions" placeholder="用于分账统计"></label>
             <datalist id="authorOptions"></datalist>
             <label class="wide-field">标签<input id="productTags" placeholder="作品、角色、属性，用逗号隔开"></label>
             <div id="tagSuggestions" class="tag-suggestions"></div>
-            <label class="wide-field">图片
+            <label class="wide-field product-image-field">商品图片
               <input id="productImage" type="file" accept="image/*">
               <span class="form-hint">建议上传实体图，尽量压缩到 1MB 以内。</span>
             </label>
-            <label class="check-row"><input id="productActive" type="checkbox" checked> 上架</label>
-            <button class="primary-btn" type="submit">保存商品</button>
-            <button id="resetProduct" class="ghost-btn" type="button">清空表单</button>
+            <div class="product-form-actions">
+              <div class="product-form-flags">
+                <label class="check-row"><input id="productActive" type="checkbox" checked> 上架</label>
+                <label class="check-row"><input id="productGift" type="checkbox"> 赠品 / 不可购买</label>
+              </div>
+              <div class="product-form-buttons">
+                <button id="resetProduct" class="ghost-btn" type="button">清空表单</button>
+                <button class="primary-btn" type="submit">保存商品</button>
+              </div>
+            </div>
           </form>
           <div class="list-heading"><h2>商品列表</h2></div>
           <div class="product-toolbar">
@@ -471,8 +480,13 @@ function mountAdminView() {
               <option value="">全部作者</option>
             </select>
             <button id="optimizeProductImages" class="ghost-btn" type="button">压缩现有图片</button>
-            <button id="bulkDeleteProducts" class="ghost-btn danger-action" type="button" disabled>批量删除</button>
-            <span id="productBulkState" class="bulk-state">已选 0 个</span>
+            <div class="product-bulk-actions">
+              <label class="select-all-products"><input id="selectAllProducts" type="checkbox"> 全选当前结果</label>
+              <span id="productBulkState" class="bulk-state">已选 0 个</span>
+              <button id="bulkActivateProducts" class="ghost-btn positive-action" type="button" disabled>批量上架</button>
+              <button id="bulkDeactivateProducts" class="ghost-btn" type="button" disabled>批量下架</button>
+              <button id="bulkDeleteProducts" class="ghost-btn danger-action" type="button" disabled>批量删除</button>
+            </div>
           </div>
           <div id="productList" class="admin-list product-management-list"></div>
         </section>
@@ -514,15 +528,19 @@ function mountAdminView() {
             </div>
           </div>
           <div class="board-actions sales-toolbar">
-            <label class="date-filter">销售日期
-              <input id="salesDateInput" type="date">
-            </label>
-            <button id="allSales" class="ghost-btn" type="button">全部历史</button>
-            <button id="todaySales" class="ghost-btn" type="button">今天</button>
-            <a class="ghost-link" href="/api/admin/export">导出订单明细</a>
-            <a class="ghost-link" href="/api/admin/export-summary">导出商品汇总</a>
-            <a id="authorExportLink" class="ghost-link" href="/api/admin/export-authors">导出作者分账</a>
-            <span id="salesScopeLabel" class="sales-scope">今天</span>
+            <div class="sales-period-control">
+              <label class="date-filter">销售日期
+                <input id="salesDateInput" type="date">
+              </label>
+              <span id="salesScopeLabel" class="sales-scope">今天</span>
+            </div>
+            <div class="sales-toolbar-actions">
+              <button id="allSales" class="ghost-btn" type="button">全部历史</button>
+              <button id="todaySales" class="ghost-btn" type="button">今天</button>
+              <a class="ghost-link" href="/api/admin/export">导出订单明细</a>
+              <a class="ghost-link" href="/api/admin/export-summary">导出商品汇总</a>
+              <a id="authorExportLink" class="ghost-link" href="/api/admin/export-authors">导出作者分账</a>
+            </div>
           </div>
           <div class="sales-summary">
             <div><span>订单数</span><strong id="salesOrderCount">0</strong></div>
@@ -560,18 +578,6 @@ function mountAdminView() {
 }
 
 function enhanceAdminForms() {
-  const stock = document.querySelector("#productStock");
-  if (stock && !document.querySelector("#productLowStock")) {
-    stock.closest("label").insertAdjacentHTML("afterend", `
-      <label>低库存提醒<input id="productLowStock" type="number" min="0" step="1" value="3"></label>
-    `);
-  }
-  const image = document.querySelector("#productImage");
-  if (image && !document.querySelector("#productGift")) {
-    image.closest("label").insertAdjacentHTML("afterend", `
-      <label class="check-row"><input id="productGift" type="checkbox"> 赠品/不可购买</label>
-    `);
-  }
   const settingsForm = document.querySelector("#settingsForm");
   if (settingsForm && !document.querySelector("#promotionEditor")) {
     settingsForm.insertAdjacentHTML("afterend", `
@@ -974,7 +980,8 @@ function renderProductTools() {
   const filter = document.querySelector("#productFilter");
   const authorFilter = document.querySelector("#productAuthorFilter");
   const bulkState = document.querySelector("#productBulkState");
-  const bulkButton = document.querySelector("#bulkDeleteProducts");
+  const bulkButtons = document.querySelectorAll("#bulkActivateProducts, #bulkDeactivateProducts, #bulkDeleteProducts");
+  const selectAll = document.querySelector("#selectAllProducts");
   const authorOptions = document.querySelector("#authorOptions");
   if (!search || !filter || !authorFilter) return;
 
@@ -989,8 +996,15 @@ function renderProductTools() {
   }
   const validIds = new Set(adminState.products.map((product) => product.id));
   adminState.selectedProductIds = new Set([...adminState.selectedProductIds].filter((id) => validIds.has(id)));
+  const visibleIds = filteredProducts().map((product) => product.id);
+  const selectedVisibleCount = visibleIds.filter((id) => adminState.selectedProductIds.has(id)).length;
   if (bulkState) bulkState.textContent = `已选 ${adminState.selectedProductIds.size} 个`;
-  if (bulkButton) bulkButton.disabled = adminState.selectedProductIds.size === 0;
+  bulkButtons.forEach((button) => button.disabled = adminState.selectedProductIds.size === 0);
+  if (selectAll) {
+    selectAll.checked = visibleIds.length > 0 && selectedVisibleCount === visibleIds.length;
+    selectAll.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleIds.length;
+    selectAll.disabled = visibleIds.length === 0;
+  }
   renderTagSuggestions();
 }
 
@@ -1264,6 +1278,19 @@ async function deleteSelectedProducts() {
   await loadAll(false);
 }
 
+async function setSelectedProductsActive(active) {
+  const ids = [...adminState.selectedProductIds];
+  if (!ids.length) return;
+  if (!active && !confirm(`确定下架选中的 ${ids.length} 个商品吗？`)) return;
+  await api("/api/admin/products/bulk-active", {
+    method: "POST",
+    body: JSON.stringify({ ids, active }),
+  });
+  adminState.selectedProductIds.clear();
+  showAdminToast(`已批量${active ? "上架" : "下架"}商品`);
+  await loadAll(false);
+}
+
 async function saveProduct(event) {
   event.preventDefault();
   try {
@@ -1500,6 +1527,19 @@ function bindAdminViewEvents() {
     adminState.productAuthorFilter = event.target.value;
     renderProducts();
   });
+  document.querySelector("#selectAllProducts").addEventListener("change", (event) => {
+    filteredProducts().forEach((product) => {
+      if (event.target.checked) adminState.selectedProductIds.add(product.id);
+      else adminState.selectedProductIds.delete(product.id);
+    });
+    renderProducts();
+  });
+  document.querySelector("#bulkActivateProducts").addEventListener("click", () => {
+    setSelectedProductsActive(true).catch((error) => alert(error.message));
+  });
+  document.querySelector("#bulkDeactivateProducts").addEventListener("click", () => {
+    setSelectedProductsActive(false).catch((error) => alert(error.message));
+  });
   document.querySelector("#bulkDeleteProducts").addEventListener("click", () => {
     deleteSelectedProducts().catch((error) => alert(error.message));
   });
@@ -1653,7 +1693,12 @@ setInterval(() => {
   if (adminView) loadOrders(true).catch(console.error);
 }, 5000);
 
-document.querySelector("#loginView").hidden = false;
+document.querySelector("#loginView").hidden = true;
 document.querySelector("#adminMount").innerHTML = "";
 adminState.mounted = false;
-loadLoginStaffChoices();
+loadLoginStaffChoices()
+  .then(checkLogin)
+  .catch((error) => {
+    console.error(error);
+    document.querySelector("#loginView").hidden = false;
+  });
