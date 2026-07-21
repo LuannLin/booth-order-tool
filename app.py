@@ -32,7 +32,7 @@ JSON_HEADERS = {
     "Cache-Control": "no-store",
 }
 ADMIN_COOKIE = "booth_admin"
-SESSIONS: set[str] = set()
+ADMIN_SESSION_TTL = 7 * 24 * 60 * 60
 DB_LOCK = threading.Lock()
 PRODUCT_MEDIA_PREFIX = "/api/media/products/"
 SETTING_MEDIA_PREFIX = "/api/media/settings/"
@@ -111,6 +111,13 @@ def init_db() -> None:
                 category TEXT NOT NULL DEFAULT '',
                 tags TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY(order_id) REFERENCES orders(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                token_hash TEXT PRIMARY KEY,
+                staff_name TEXT NOT NULL DEFAULT '',
+                expires_at INTEGER NOT NULL,
+                created_at TEXT NOT NULL
             );
             """
         )
@@ -240,8 +247,8 @@ def setting_media_url(key: str, value: str) -> str:
 def settings_dict(conn: sqlite3.Connection, public: bool = True, media_urls: bool = False) -> dict:
     rows = conn.execute("SELECT key, value FROM settings").fetchall()
     result = {row["key"]: row["value"] for row in rows}
+    result.pop("admin_password", None)
     if public:
-        result.pop("admin_password", None)
         result.pop("staff_members", None)
     if media_urls:
         for key in MEDIA_SETTING_KEYS:
@@ -368,10 +375,35 @@ def quantity_rule_matches(product: sqlite3.Row, rule: dict) -> bool:
     return True
 
 
-def require_admin(handler: BaseHTTPRequestHandler) -> bool:
+def admin_cookie_token(handler: BaseHTTPRequestHandler) -> str:
     jar = cookies.SimpleCookie(handler.headers.get("Cookie"))
     token = jar.get(ADMIN_COOKIE)
-    if token and token.value in SESSIONS:
+    return token.value if token else ""
+
+
+def admin_session(handler: BaseHTTPRequestHandler) -> sqlite3.Row | None:
+    token = admin_cookie_token(handler)
+    if not token:
+        return None
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = int(time.time())
+    with DB_LOCK, connect() as conn:
+        conn.execute("DELETE FROM admin_sessions WHERE expires_at <= ?", (now,))
+        session = conn.execute(
+            "SELECT staff_name, expires_at FROM admin_sessions WHERE token_hash = ? AND expires_at > ?",
+            (token_hash, now),
+        ).fetchone()
+        conn.commit()
+    return session
+
+
+def cookie_secure_suffix(handler: BaseHTTPRequestHandler) -> str:
+    forwarded_proto = handler.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip().lower()
+    return "; Secure" if forwarded_proto == "https" else ""
+
+
+def require_admin(handler: BaseHTTPRequestHandler) -> bool:
+    if admin_session(handler):
         return True
     write_json(handler, 401, {"error": "需要先登录后台"})
     return False
@@ -635,7 +667,12 @@ class BoothHandler(BaseHTTPRequestHandler):
             with DB_LOCK, connect() as conn:
                 return write_json(self, 200, list_products(conn, admin=False))
         if path == "/api/admin/me":
-            return write_json(self, 200, {"ok": self.is_admin()})
+            session = admin_session(self)
+            return write_json(
+                self,
+                200,
+                {"ok": bool(session), "staff_name": str(session["staff_name"]) if session else ""},
+            )
         if path == "/api/admin/staff-list":
             with DB_LOCK, connect() as conn:
                 settings = settings_dict(conn, public=False)
@@ -694,6 +731,10 @@ class BoothHandler(BaseHTTPRequestHandler):
                 if not require_admin(self):
                     return
                 return self.create_product()
+            if path == "/api/admin/products/bulk-active":
+                if not require_admin(self):
+                    return
+                return self.bulk_set_products_active()
             if path == "/api/admin/settings":
                 if not require_admin(self):
                     return
@@ -742,9 +783,7 @@ class BoothHandler(BaseHTTPRequestHandler):
         write_json(self, 404, {"error": "没有找到这个接口"})
 
     def is_admin(self) -> bool:
-        jar = cookies.SimpleCookie(self.headers.get("Cookie"))
-        token = jar.get(ADMIN_COOKIE)
-        return bool(token and token.value in SESSIONS)
+        return bool(admin_session(self))
 
     def serve_file(self, filename: str) -> None:
         safe = filename.strip("/").replace("\\", "/")
@@ -816,7 +855,8 @@ class BoothHandler(BaseHTTPRequestHandler):
         staff_name = str(payload.get("staff_name", "")).strip()[:30]
         with DB_LOCK, connect() as conn:
             settings = settings_dict(conn, public=False)
-            expected = settings.get("admin_password", "123456")
+            password_row = conn.execute("SELECT value FROM settings WHERE key = 'admin_password'").fetchone()
+            expected = str(password_row["value"]) if password_row else "123456"
             members = staff_members_from_settings(settings)
         if password != expected:
             return write_json(self, 403, {"error": "密码不对"})
@@ -826,23 +866,38 @@ class BoothHandler(BaseHTTPRequestHandler):
         elif not staff_name:
             staff_name = "摊主"
         token = secrets.token_urlsafe(24)
-        SESSIONS.add(token)
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        expires_at = int(time.time()) + ADMIN_SESSION_TTL
+        with DB_LOCK, connect() as conn:
+            conn.execute(
+                "INSERT INTO admin_sessions(token_hash, staff_name, expires_at, created_at) VALUES(?, ?, ?, ?)",
+                (token_hash, staff_name, expires_at, now_text()),
+            )
+            conn.commit()
         data = json.dumps({"ok": True, "staff_name": staff_name}, ensure_ascii=False).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Set-Cookie", f"{ADMIN_COOKIE}={token}; Path=/; SameSite=Lax")
+        self.send_header(
+            "Set-Cookie",
+            f"{ADMIN_COOKIE}={token}; Path=/; Max-Age={ADMIN_SESSION_TTL}; HttpOnly; SameSite=Lax{cookie_secure_suffix(self)}",
+        )
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
     def logout(self) -> None:
-        jar = cookies.SimpleCookie(self.headers.get("Cookie"))
-        token = jar.get(ADMIN_COOKIE)
+        token = admin_cookie_token(self)
         if token:
-            SESSIONS.discard(token.value)
+            token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+            with DB_LOCK, connect() as conn:
+                conn.execute("DELETE FROM admin_sessions WHERE token_hash = ?", (token_hash,))
+                conn.commit()
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Set-Cookie", f"{ADMIN_COOKIE}=; Path=/; Max-Age=0; SameSite=Lax")
+        self.send_header(
+            "Set-Cookie",
+            f"{ADMIN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{cookie_secure_suffix(self)}",
+        )
         self.end_headers()
         self.wfile.write(b'{"ok": true}')
 
@@ -1145,6 +1200,33 @@ class BoothHandler(BaseHTTPRequestHandler):
         if not product:
             return write_json(self, 404, {"error": "商品不存在"})
         write_json(self, 200, {"ok": True, "id": product_id})
+
+    def bulk_set_products_active(self) -> None:
+        payload = read_body(self)
+        raw_ids = payload.get("ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ValueError("请先选择商品")
+        if not isinstance(payload.get("active"), bool):
+            raise ValueError("上下架状态不正确")
+
+        product_ids: list[int] = []
+        for raw_id in raw_ids:
+            product_id = int(raw_id)
+            if product_id > 0 and product_id not in product_ids:
+                product_ids.append(product_id)
+        if not product_ids:
+            raise ValueError("请先选择商品")
+        if len(product_ids) > 1000:
+            raise ValueError("一次最多操作 1000 个商品")
+
+        placeholders = ",".join("?" for _ in product_ids)
+        with DB_LOCK, connect() as conn:
+            cur = conn.execute(
+                f"UPDATE products SET active = ?, updated_at = ? WHERE id IN ({placeholders})",
+                (1 if payload["active"] else 0, now_text(), *product_ids),
+            )
+            conn.commit()
+        write_json(self, 200, {"ok": True, "updated": cur.rowcount})
 
     def update_order(self, order_id: int) -> None:
         payload = read_body(self)
