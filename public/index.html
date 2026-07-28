@@ -27,7 +27,9 @@
       <div class="toolbar">
         <input id="searchInput" type="search" placeholder="搜索商品、作者、标签">
         <select id="categoryFilter"><option value="">全部分类</option></select>
+        <select id="authorFilter"><option value="">全部作者</option></select>
       </div>
+      <details id="bundlePromotions" class="bundle-promotions" hidden></details>
       <div id="productGrid" class="product-grid"></div>
     </section>
 
@@ -40,8 +42,9 @@
         <span id="cartCount" class="cart-count" hidden>0 件</span>
       </div>
       <div id="cartItems" class="cart-items empty">还没有选择商品</div>
+      <div id="cartPromotionStatus" class="cart-promotion-status" hidden></div>
       <div class="cart-total">
-        <span>合计</span>
+        <span id="cartTotalLabel">合计</span>
         <strong id="cartTotal">¥0.00</strong>
       </div>
       <form id="checkoutForm" class="checkout-form">
