@@ -88,6 +88,7 @@ def init_db() -> None:
                 order_status TEXT NOT NULL DEFAULT 'new',
                 subtotal REAL NOT NULL DEFAULT 0,
                 discount_total REAL NOT NULL DEFAULT 0,
+                discount_details TEXT NOT NULL DEFAULT '[]',
                 total REAL NOT NULL DEFAULT 0,
                 note TEXT NOT NULL DEFAULT '',
                 picker_name TEXT NOT NULL DEFAULT '',
@@ -129,7 +130,7 @@ def init_db() -> None:
             "alipay_qr": "",
             "admin_password": "123456",
             "staff_members": "[]",
-            "promotions": '{"amount_gifts":[],"quantity_gifts":[],"amount_discounts":[]}',
+            "promotions": '{"amount_gifts":[],"quantity_gifts":[],"bundle_discounts":[],"amount_discounts":[]}',
         }
         for key, value in defaults.items():
             conn.execute(
@@ -147,6 +148,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE orders ADD COLUMN picker_name TEXT NOT NULL DEFAULT ''")
         if "picker_at" not in order_columns:
             conn.execute("ALTER TABLE orders ADD COLUMN picker_at TEXT NOT NULL DEFAULT ''")
+        if "discount_details" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN discount_details TEXT NOT NULL DEFAULT '[]'")
         item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(order_items)").fetchall()}
         if "picked" not in item_columns:
             conn.execute("ALTER TABLE order_items ADD COLUMN picked INTEGER NOT NULL DEFAULT 0")
@@ -330,6 +333,30 @@ def clean_promotions(raw_value) -> dict:
         if rule["gift_product_id"] > 0:
             quantity_gifts.append(rule)
 
+    bundle_discounts = []
+    for item in raw.get("bundle_discounts", []):
+        try:
+            raw_product_ids = item.get("product_ids") or []
+            if not isinstance(raw_product_ids, list):
+                raw_product_ids = []
+            product_ids = []
+            seen_ids = set()
+            for value in raw_product_ids:
+                product_id = int_value(value)
+                if product_id > 0 and product_id not in seen_ids:
+                    product_ids.append(product_id)
+                    seen_ids.add(product_id)
+            rule = {
+                "name": str(item.get("name") or "组合套装价").strip()[:40],
+                "product_ids": product_ids,
+                "bundle_price": money_value(item.get("bundle_price")),
+                "active": bool(item.get("active", True)),
+            }
+        except (TypeError, ValueError):
+            continue
+        if len(rule["product_ids"]) >= 2:
+            bundle_discounts.append(rule)
+
     amount_discounts = []
     for item in raw.get("amount_discounts", []):
         try:
@@ -347,6 +374,7 @@ def clean_promotions(raw_value) -> dict:
     return {
         "amount_gifts": amount_gifts,
         "quantity_gifts": quantity_gifts,
+        "bundle_discounts": bundle_discounts,
         "amount_discounts": amount_discounts,
     }
 
@@ -373,6 +401,88 @@ def quantity_rule_matches(product: sqlite3.Row, rule: dict) -> bool:
     if trigger_type == "products":
         return int(product["id"]) in set(rule.get("trigger_product_ids", []))
     return True
+
+
+def clean_discount_details(raw_value) -> list[dict]:
+    if isinstance(raw_value, str):
+        try:
+            raw = json.loads(raw_value or "[]")
+        except json.JSONDecodeError:
+            raw = []
+    elif isinstance(raw_value, list):
+        raw = raw_value
+    else:
+        raw = []
+    details = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            amount = max(0.0, round(float(item.get("amount") or 0), 2))
+            count = max(1, int(item.get("count") or 1))
+        except (TypeError, ValueError):
+            continue
+        if amount <= 0:
+            continue
+        raw_shares = item.get("author_shares") or {}
+        author_shares = {}
+        if isinstance(raw_shares, dict):
+            for author, value in raw_shares.items():
+                try:
+                    share = max(0.0, round(float(value or 0), 2))
+                except (TypeError, ValueError):
+                    continue
+                if share > 0:
+                    author_shares[str(author).strip() or "未填作者"] = share
+        raw_product_ids = item.get("product_ids", [])
+        if not isinstance(raw_product_ids, list):
+            raw_product_ids = []
+        product_ids = []
+        for value in raw_product_ids:
+            try:
+                product_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if product_id > 0:
+                product_ids.append(product_id)
+        details.append({
+            "type": "bundle" if item.get("type") == "bundle" else "amount",
+            "name": str(item.get("name") or "优惠").strip()[:40],
+            "count": count,
+            "amount": amount,
+            "product_ids": product_ids,
+            "author_shares": author_shares,
+        })
+    return details
+
+
+def allocate_money(amount: float, weights: dict[str, float]) -> dict[str, float]:
+    clean_weights = {
+        (str(key).strip() or "未填作者"): max(0.0, float(value or 0))
+        for key, value in weights.items()
+        if float(value or 0) > 0
+    }
+    total_weight = sum(clean_weights.values())
+    amount_cents = max(0, round(float(amount or 0) * 100))
+    if total_weight <= 0 or amount_cents <= 0:
+        return {}
+    shares_cents = {}
+    fractions = []
+    assigned = 0
+    for author, weight in clean_weights.items():
+        raw_share = amount_cents * weight / total_weight
+        cents = int(raw_share)
+        shares_cents[author] = cents
+        assigned += cents
+        fractions.append((raw_share - cents, author))
+    fractions.sort(key=lambda item: (-item[0], item[1]))
+    for _, author in fractions[:amount_cents - assigned]:
+        shares_cents[author] += 1
+    return {
+        author: round(cents / 100, 2)
+        for author, cents in shares_cents.items()
+        if cents > 0
+    }
 
 
 def admin_cookie_token(handler: BaseHTTPRequestHandler) -> str:
@@ -473,6 +583,7 @@ def order_detail(conn: sqlite3.Connection, order_id: int) -> dict | None:
         (order_id,),
     ).fetchall()
     data = dict(order)
+    data["discount_details"] = clean_discount_details(data.get("discount_details", "[]"))
     data["items"] = [dict(item) for item in items]
     return data
 
@@ -488,6 +599,7 @@ def list_orders(conn: sqlite3.Connection, order_date: str = "") -> list[dict]:
     result = []
     for order in orders:
         data = dict(order)
+        data["discount_details"] = clean_discount_details(data.get("discount_details", "[]"))
         items = conn.execute(
             "SELECT * FROM order_items WHERE order_id = ? ORDER BY id",
             (order["id"],),
@@ -546,6 +658,7 @@ def sales_stats(conn: sqlite3.Connection, order_date: str = "") -> dict:
         SELECT
             o.id AS order_id,
             o.discount_total,
+            o.discount_details,
             oi.author,
             oi.item_type,
             oi.price,
@@ -559,18 +672,23 @@ def sales_stats(conn: sqlite3.Connection, order_date: str = "") -> dict:
     ).fetchall()
     rows_by_order: dict[int, list[sqlite3.Row]] = {}
     discounts_by_order: dict[int, float] = {}
+    discount_details_by_order: dict[int, list[dict]] = {}
     for row in author_rows:
         order_id = int(row["order_id"])
         rows_by_order.setdefault(order_id, []).append(row)
         discounts_by_order[order_id] = float(row["discount_total"] or 0)
+        discount_details_by_order[order_id] = clean_discount_details(row["discount_details"])
 
     author_map: dict[str, dict] = {}
     for order_id, rows in rows_by_order.items():
-        sale_gross_total = sum(
-            round(float(row["price"] or 0) * int(row["quantity"] or 0), 2)
-            for row in rows
-            if row["item_type"] != "gift" and float(row["price"] or 0) > 0
-        )
+        sale_gross_by_author: dict[str, float] = {}
+        for row in rows:
+            if row["item_type"] == "gift":
+                continue
+            author = str(row["author"] or "").strip() or "未填作者"
+            line_gross = round(float(row["price"] or 0) * int(row["quantity"] or 0), 2)
+            sale_gross_by_author[author] = sale_gross_by_author.get(author, 0.0) + line_gross
+        sale_gross_total = round(sum(sale_gross_by_author.values()), 2)
         discount_total = min(round(float(discounts_by_order.get(order_id, 0)), 2), sale_gross_total)
         touched_authors: set[str] = set()
         for row in rows:
@@ -591,9 +709,29 @@ def sales_stats(conn: sqlite3.Connection, order_date: str = "") -> dict:
             else:
                 data["sold_quantity"] += quantity
                 data["gross_sales"] += line_gross
-                if sale_gross_total > 0 and line_gross > 0 and discount_total > 0:
-                    data["discount_share"] += discount_total * line_gross / sale_gross_total
             touched_authors.add(author)
+
+        detailed_shares: dict[str, float] = {}
+        for detail in discount_details_by_order.get(order_id, []):
+            for author, share in detail.get("author_shares", {}).items():
+                detailed_shares[author] = detailed_shares.get(author, 0.0) + float(share or 0)
+        allocated = min(round(sum(detailed_shares.values()), 2), discount_total)
+        for author, share in detailed_shares.items():
+            if author not in author_map:
+                continue
+            author_map[author]["discount_share"] += min(
+                round(float(share or 0), 2),
+                sale_gross_by_author.get(author, 0.0),
+            )
+        remaining_discount = round(max(0.0, discount_total - allocated), 2)
+        if remaining_discount > 0:
+            remaining_weights = {
+                author: max(0.0, gross - detailed_shares.get(author, 0.0))
+                for author, gross in sale_gross_by_author.items()
+            }
+            fallback_shares = allocate_money(remaining_discount, remaining_weights)
+            for author, share in fallback_shares.items():
+                author_map[author]["discount_share"] += share
         for author in touched_authors:
             author_map[author]["order_ids"].add(order_id)
 
@@ -954,7 +1092,6 @@ class BoothHandler(BaseHTTPRequestHandler):
             products = {row["id"]: row for row in rows}
             clean_items = []
             subtotal = 0.0
-            sale_quantity = 0
             for product_id, quantity in requested.items():
                 product = products.get(product_id)
                 if not product or int(product["is_gift"]):
@@ -962,10 +1099,55 @@ class BoothHandler(BaseHTTPRequestHandler):
                 if product["stock"] < quantity:
                     raise ValueError(f"{product['name']} 库存不够了")
                 subtotal += round(float(product["price"]) * quantity, 2)
-                sale_quantity += quantity
                 clean_items.append((product, quantity))
 
             promotions = promotions_from_settings(settings_dict(conn, public=False))
+            subtotal = round(subtotal, 2)
+            remaining_bundle_quantities = dict(requested)
+            gross_by_author: dict[str, float] = {}
+            discount_by_author: dict[str, float] = {}
+            discount_details: list[dict] = []
+            for product, quantity in clean_items:
+                author = str(product["author"] or "").strip() or "未填作者"
+                gross_by_author[author] = round(
+                    gross_by_author.get(author, 0.0) + float(product["price"]) * quantity,
+                    2,
+                )
+
+            for rule in promotions["bundle_discounts"]:
+                if not rule["active"]:
+                    continue
+                product_ids = rule["product_ids"]
+                if any(product_id not in products for product_id in product_ids):
+                    continue
+                set_count = min(remaining_bundle_quantities.get(product_id, 0) for product_id in product_ids)
+                if set_count <= 0:
+                    continue
+                regular_set_price = round(sum(float(products[product_id]["price"]) for product_id in product_ids), 2)
+                saving_per_set = round(max(0.0, regular_set_price - float(rule["bundle_price"])), 2)
+                if saving_per_set <= 0:
+                    continue
+                discount_amount = round(saving_per_set * set_count, 2)
+                author_weights: dict[str, float] = {}
+                for product_id in product_ids:
+                    product = products[product_id]
+                    author = str(product["author"] or "").strip() or "未填作者"
+                    author_weights[author] = author_weights.get(author, 0.0) + float(product["price"]) * set_count
+                    remaining_bundle_quantities[product_id] -= set_count
+                author_shares = allocate_money(discount_amount, author_weights)
+                for author, share in author_shares.items():
+                    discount_by_author[author] = round(discount_by_author.get(author, 0.0) + share, 2)
+                discount_details.append({
+                    "type": "bundle",
+                    "name": rule["name"],
+                    "count": set_count,
+                    "amount": discount_amount,
+                    "product_ids": product_ids,
+                    "author_shares": author_shares,
+                })
+
+            bundle_discount_total = round(sum(detail["amount"] for detail in discount_details), 2)
+            promotion_subtotal = round(max(0.0, subtotal - bundle_discount_total), 2)
             gift_rule_ids = sorted({
                 rule["gift_product_id"]
                 for group in ("amount_gifts", "quantity_gifts")
@@ -1002,7 +1184,7 @@ class BoothHandler(BaseHTTPRequestHandler):
                 return gift
 
             for rule in promotions["amount_gifts"]:
-                if rule["active"] and subtotal >= rule["threshold"]:
+                if rule["active"] and promotion_subtotal >= rule["threshold"]:
                     gift = claim_gift(rule)
                     if gift:
                         gift_items.append((gift, rule["gift_quantity"], rule["name"]))
@@ -1021,12 +1203,32 @@ class BoothHandler(BaseHTTPRequestHandler):
                             rule["active"] = False
                             promotions_dirty = True
 
-            discount_total = 0.0
             for rule in promotions["amount_discounts"]:
-                if rule["active"] and subtotal >= rule["threshold"]:
-                    discount_total += rule["discount"]
-            subtotal = round(subtotal, 2)
-            discount_total = min(round(discount_total, 2), subtotal)
+                if not rule["active"] or promotion_subtotal < rule["threshold"]:
+                    continue
+                current_discount = round(sum(detail["amount"] for detail in discount_details), 2)
+                discount_amount = round(min(float(rule["discount"]), max(0.0, subtotal - current_discount)), 2)
+                if discount_amount <= 0:
+                    continue
+                remaining_author_values = {
+                    author: max(0.0, gross - discount_by_author.get(author, 0.0))
+                    for author, gross in gross_by_author.items()
+                }
+                author_shares = allocate_money(discount_amount, remaining_author_values)
+                for author, share in author_shares.items():
+                    discount_by_author[author] = round(discount_by_author.get(author, 0.0) + share, 2)
+                discount_details.append({
+                    "type": "amount",
+                    "name": rule["name"],
+                    "count": 1,
+                    "amount": discount_amount,
+                    "product_ids": [],
+                    "author_shares": author_shares,
+                })
+            discount_total = min(
+                round(sum(detail["amount"] for detail in discount_details), 2),
+                subtotal,
+            )
             total = round(max(0.0, subtotal - discount_total), 2)
 
             pickup_code = generate_pickup_code(conn)
@@ -1034,10 +1236,26 @@ class BoothHandler(BaseHTTPRequestHandler):
             payment_status = "cash_pending" if payment_method == "cash" else "pending"
             cur = conn.execute(
                 """
-                INSERT INTO orders(pickup_code, client_token, receive_type, phone, phone_tail, pickup_time, payment_method, payment_status, order_status, subtotal, discount_total, total, note, created_at, updated_at)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?)
+                INSERT INTO orders(pickup_code, client_token, receive_type, phone, phone_tail, pickup_time, payment_method, payment_status, order_status, subtotal, discount_total, discount_details, total, note, created_at, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (pickup_code, client_token, receive_type, phone, phone_tail, pickup_time, payment_method, payment_status, subtotal, discount_total, total, note, created, created),
+                (
+                    pickup_code,
+                    client_token,
+                    receive_type,
+                    phone,
+                    phone_tail,
+                    pickup_time,
+                    payment_method,
+                    payment_status,
+                    subtotal,
+                    discount_total,
+                    json.dumps(discount_details, ensure_ascii=False),
+                    total,
+                    note,
+                    created,
+                    created,
+                ),
             )
             order_id = cur.lastrowid
 
