@@ -87,10 +87,137 @@ function renderBooth() {
   }
 }
 
+function promotions() {
+  try {
+    const data = typeof state.settings.promotions === "string"
+      ? JSON.parse(state.settings.promotions || "{}")
+      : state.settings.promotions || {};
+    return {
+      bundle_discounts: Array.isArray(data.bundle_discounts) ? data.bundle_discounts : [],
+      amount_discounts: Array.isArray(data.amount_discounts) ? data.amount_discounts : [],
+    };
+  } catch (error) {
+    return { bundle_discounts: [], amount_discounts: [] };
+  }
+}
+
+function bundleRules() {
+  const productMap = new Map(state.products.map((product) => [Number(product.id), product]));
+  return promotions().bundle_discounts.map((rule) => {
+    const productIds = [...new Set((rule.product_ids || []).map(Number).filter(Boolean))];
+    const products = productIds.map((id) => productMap.get(id)).filter(Boolean);
+    const regularPrice = products.reduce((sum, product) => sum + Number(product.price || 0), 0);
+    const bundlePrice = Number(rule.bundle_price || 0);
+    return {
+      ...rule,
+      productIds,
+      products,
+      regularPrice,
+      bundlePrice,
+      saving: Math.max(0, regularPrice - bundlePrice),
+    };
+  }).filter((rule) => (
+    rule.active !== false
+    && rule.productIds.length >= 2
+    && rule.products.length === rule.productIds.length
+    && rule.saving > 0
+  ));
+}
+
+function calculateBundleDiscount(lines) {
+  const quantities = new Map(lines.map((line) => [Number(line.product.id), Number(line.quantity || 0)]));
+  const remaining = new Map(quantities);
+  const details = [];
+  bundleRules().forEach((rule) => {
+    const count = Math.min(...rule.productIds.map((id) => remaining.get(id) || 0));
+    if (count <= 0) return;
+    rule.productIds.forEach((id) => remaining.set(id, (remaining.get(id) || 0) - count));
+    details.push({
+      type: "bundle",
+      name: rule.name || "组合套装价",
+      count,
+      amount: rule.saving * count,
+      product_ids: rule.productIds,
+    });
+  });
+  return { details, remaining };
+}
+
+function promotionQuote(lines) {
+  const subtotal = lines.reduce((sum, line) => sum + Number(line.product.price || 0) * line.quantity, 0);
+  const bundle = calculateBundleDiscount(lines);
+  const details = [...bundle.details];
+  const bundleDiscount = details.reduce((sum, detail) => sum + detail.amount, 0);
+  const promotionSubtotal = Math.max(0, subtotal - bundleDiscount);
+  let discountTotal = bundleDiscount;
+  promotions().amount_discounts.forEach((rule) => {
+    const threshold = Number(rule.threshold || 0);
+    if (rule.active === false || promotionSubtotal < threshold) return;
+    const amount = Math.min(Number(rule.discount || 0), Math.max(0, subtotal - discountTotal));
+    if (amount <= 0) return;
+    details.push({
+      type: "amount",
+      name: rule.name || "满额减价",
+      count: 1,
+      amount,
+      product_ids: [],
+    });
+    discountTotal += amount;
+  });
+  return {
+    subtotal,
+    discountTotal: Math.min(subtotal, discountTotal),
+    total: Math.max(0, subtotal - discountTotal),
+    details,
+  };
+}
+
 function renderFilters() {
-  const select = document.querySelector("#categoryFilter");
+  const categorySelect = document.querySelector("#categoryFilter");
+  const authorSelect = document.querySelector("#authorFilter");
+  const selectedCategory = categorySelect.value;
+  const selectedAuthor = authorSelect.value;
   const categories = [...new Set(state.products.map((p) => p.category).filter(Boolean))].sort();
-  select.innerHTML = `<option value="">全部分类</option>${categories.map((c) => `<option value="${c}">${c}</option>`).join("")}`;
+  const authors = [...new Set(state.products.map((p) => p.author).filter(Boolean))].sort();
+  const hasUnassignedAuthor = state.products.some((product) => !String(product.author || "").trim());
+  categorySelect.innerHTML = `<option value="">全部分类</option>${categories.map((category) => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`).join("")}`;
+  authorSelect.innerHTML = `
+    <option value="">全部作者</option>
+    ${authors.map((author) => `<option value="${escapeHtml(author)}">${escapeHtml(author)}</option>`).join("")}
+    ${hasUnassignedAuthor ? `<option value="__unassigned">未标作者</option>` : ""}
+  `;
+  if ([...categorySelect.options].some((option) => option.value === selectedCategory)) categorySelect.value = selectedCategory;
+  if ([...authorSelect.options].some((option) => option.value === selectedAuthor)) authorSelect.value = selectedAuthor;
+}
+
+function renderBundlePromotions() {
+  const panel = document.querySelector("#bundlePromotions");
+  const rules = bundleRules().filter((rule) => rule.products.every((product) => Number(product.stock || 0) > 0));
+  panel.hidden = rules.length === 0;
+  panel.innerHTML = rules.length ? `
+    <summary class="bundle-promotions-summary">
+      <span><strong>套装优惠</strong><small>共 ${rules.length} 项</small></span>
+      <span class="bundle-summary-action">
+        <span class="bundle-summary-closed">查看</span>
+        <span class="bundle-summary-open">收起</span>
+        <i aria-hidden="true"></i>
+      </span>
+    </summary>
+    <div class="bundle-promotion-list">
+      ${rules.map((rule) => `
+        <article class="bundle-promotion">
+          <div>
+            <strong>${escapeHtml(rule.name || "组合套装价")}</strong>
+            <span>${rule.products.map((product) => escapeHtml(product.name)).join(" + ")}</span>
+          </div>
+          <div class="bundle-promotion-price">
+            <strong>${money(rule.bundlePrice)} / 套</strong>
+            <span>单买合计 ${money(rule.regularPrice)}</span>
+          </div>
+        </article>
+      `).join("")}
+    </div>
+  ` : "";
 }
 
 function selectedQuantity(productId) {
@@ -114,11 +241,15 @@ function stockText(product) {
 function renderProducts() {
   const search = document.querySelector("#searchInput").value.trim().toLowerCase();
   const category = document.querySelector("#categoryFilter").value;
+  const author = document.querySelector("#authorFilter").value;
   const grid = document.querySelector("#productGrid");
   const products = state.products.filter((product) => {
     const text = `${product.name} ${product.author} ${product.tags} ${product.category}`.toLowerCase();
-    return (!category || product.category === category) && (!search || text.includes(search));
+    const authorMatches = !author
+      || (author === "__unassigned" ? !String(product.author || "").trim() : product.author === author);
+    return (!category || product.category === category) && authorMatches && (!search || text.includes(search));
   }).sort((a, b) => Number(a.stock <= 0) - Number(b.stock <= 0));
+  const bundledProductIds = new Set(bundleRules().flatMap((rule) => rule.productIds));
   const count = document.querySelector("#productCount");
   if (count) count.textContent = `${products.length} 件制品`;
   grid.innerHTML = products.map((product) => {
@@ -131,6 +262,7 @@ function renderProducts() {
         <div class="product-media">
           ${productImage(product)}
           ${inCart ? `<div class="in-cart-badge">已选 ${inCart}</div>` : ""}
+          ${bundledProductIds.has(product.id) && !soldOut ? `<span class="bundle-badge">可成套</span>` : ""}
           ${soldOut ? `<span class="sold-out-badge">已售罄</span>` : ""}
         </div>
         <div class="product-copy">
@@ -171,17 +303,42 @@ function renderCart() {
       </div>
     `).join("");
   }
-  const total = lines.reduce((sum, line) => sum + line.product.price * line.quantity, 0);
+  const quote = promotionQuote(lines);
   const count = lines.reduce((sum, line) => sum + line.quantity, 0);
   const countBadge = document.querySelector("#cartCount");
   countBadge.hidden = count === 0;
   countBadge.textContent = `${count} 件`;
-  document.querySelector("#cartTotal").textContent = money(total);
+  document.querySelector("#cartTotalLabel").textContent = quote.discountTotal > 0 ? "优惠后合计" : "合计";
+  document.querySelector("#cartTotal").textContent = money(quote.total);
+  const promotionStatus = document.querySelector("#cartPromotionStatus");
+  const applied = quote.details.map((detail) => `
+    <div class="cart-promotion-applied">
+      <span>${detail.type === "bundle" ? "套装计价：" : "优惠："}${escapeHtml(detail.name)}${detail.type === "bundle" ? ` × ${detail.count} 套` : ""}</span>
+      <strong>- ${money(detail.amount)}</strong>
+    </div>
+  `);
+  const quantities = new Map(lines.map((line) => [Number(line.product.id), Number(line.quantity || 0)]));
+  const progress = bundleRules().flatMap((rule) => {
+    const values = rule.productIds.map((id) => quantities.get(id) || 0);
+    const minQuantity = Math.min(...values);
+    const maxQuantity = Math.max(...values);
+    if (maxQuantity <= minQuantity) return [];
+    const missing = rule.products.filter((product) => (quantities.get(product.id) || 0) === minQuantity);
+    if (!missing.length || missing.length > 2) return [];
+    return [`
+      <div class="cart-promotion-progress">
+        <small>组合信息：「${escapeHtml(rule.name || "组合套装价")}」尚缺 ${missing.map((product) => escapeHtml(product.name)).join("、")}</small>
+      </div>
+    `];
+  }).slice(0, 2);
+  const promotionMarkup = [...applied, ...progress];
+  promotionStatus.hidden = promotionMarkup.length === 0;
+  promotionStatus.innerHTML = promotionMarkup.join("");
   const shortcut = document.querySelector("#cartShortcut");
   if (shortcut) {
     shortcut.hidden = count === 0;
     document.querySelector("#shortcutCount").textContent = count;
-    document.querySelector("#shortcutTotal").textContent = money(total);
+    document.querySelector("#shortcutTotal").textContent = money(quote.total);
   }
   document.querySelector("#submitOrder").disabled = lines.length === 0;
 }
@@ -254,10 +411,19 @@ function orderPriceDetails(order) {
   if (discount <= 0) {
     return `<p class="order-total-line"><strong>合计 ${money(total)}</strong></p>`;
   }
+  const details = Array.isArray(order.discount_details) ? order.discount_details : [];
+  const detailRows = details.length
+    ? details.map((detail) => `
+        <div class="discount">
+          <span>${escapeHtml(detail.name || "优惠")}${detail.type === "bundle" && Number(detail.count || 1) > 1 ? ` × ${Number(detail.count)} 套` : ""}</span>
+          <strong>- ${money(detail.amount)}</strong>
+        </div>
+      `).join("")
+    : `<div class="discount"><span>优惠</span><strong>- ${money(discount)}</strong></div>`;
   return `
     <div class="price-breakdown">
       <div><span>原价</span><strong>${money(subtotal)}</strong></div>
-      <div class="discount"><span>满减</span><strong>- ${money(discount)}</strong></div>
+      ${detailRows}
       <div class="final"><span>优惠后</span><strong>${money(total)}</strong></div>
     </div>
   `;
@@ -384,7 +550,9 @@ async function load() {
   state.products = products;
   renderBooth();
   renderFilters();
+  renderBundlePromotions();
   renderProducts();
+  renderCart();
 }
 
 document.addEventListener("click", (event) => {
@@ -417,6 +585,7 @@ document.addEventListener("click", (event) => {
 
 document.querySelector("#searchInput").addEventListener("input", renderProducts);
 document.querySelector("#categoryFilter").addEventListener("change", renderProducts);
+document.querySelector("#authorFilter").addEventListener("change", renderProducts);
 document.querySelector("#checkoutForm").addEventListener("submit", submitOrder);
 document.querySelector("#closeDialog").addEventListener("click", () => document.querySelector("#orderDialog").close());
 document.querySelector("#phoneInput").addEventListener("input", (event) => {
