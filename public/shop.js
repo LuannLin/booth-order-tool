@@ -306,16 +306,22 @@ function renderBundlePromotions() {
     </summary>
     <div class="bundle-promotion-list">
       ${rules.map((rule) => `
-        <article class="bundle-promotion">
-          <div>
+        <details class="bundle-promotion">
+          <summary class="bundle-promotion-summary">
+            <div class="bundle-promotion-copy">
             <strong>${escapeHtml(rule.name || "组合套装价")}</strong>
-            <span>${rule.products.map((product) => escapeHtml(product.name)).join(" + ")}</span>
-          </div>
-          <div class="bundle-promotion-price">
-            <strong>${money(rule.bundlePrice)} / 套</strong>
-            <span>单买合计 ${money(rule.regularPrice)}</span>
-          </div>
-        </article>
+              <span>包含 ${rule.products.length} 件制品</span>
+            </div>
+            <div class="bundle-promotion-price">
+              <strong>${money(rule.bundlePrice)} / 套</strong>
+              <span>单买合计 ${money(rule.regularPrice)}</span>
+            </div>
+            <i class="bundle-promotion-chevron" aria-hidden="true"></i>
+          </summary>
+          <ol class="bundle-product-list">
+            ${rule.products.map((product) => `<li>${escapeHtml(product.name)}</li>`).join("")}
+          </ol>
+        </details>
       `).join("")}
     </div>
   ` : "";
