@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>现场下单码</title>
+  <link rel="stylesheet" href="/public/styles.css">
+</head>
+<body class="onsite-display-body">
+  <main id="onsiteDisplay" class="onsite-display" hidden>
+    <header class="onsite-display-header">
+      <div class="onsite-display-brand">
+        <img id="onsiteLogo" alt="" hidden>
+        <div>
+          <span>现场下单</span>
+          <h1 id="onsiteBoothName">摊位点单</h1>
+        </div>
+      </div>
+      <div id="onsiteLiveBadge" class="onsite-live-badge">现场码接单中</div>
+    </header>
+
+    <section class="onsite-code-stage">
+      <div class="onsite-instruction">
+        <strong>先扫描摊位二维码选择制品</strong>
+        <span>提交订单前，在结算区输入下方四位码</span>
+      </div>
+      <output id="onsiteCode" class="onsite-code">----</output>
+      <div class="onsite-countdown">
+        <span>本码剩余有效时间</span>
+        <strong id="onsiteCountdown">--:--</strong>
+      </div>
+    </section>
+
+    <footer class="onsite-display-footer">
+      <button id="onsiteFullscreen" class="ghost-btn" type="button">全屏并保持亮屏</button>
+    </footer>
+  </main>
+
+  <section id="onsiteUnavailable" class="onsite-unavailable" hidden>
+    <strong id="onsiteUnavailableTitle">现场码暂未开启</strong>
+    <p id="onsiteUnavailableText">请先在摊主后台开启“现场码接单”。</p>
+    <a id="onsiteAdminLink" class="primary-btn" href="#">返回摊主后台</a>
+  </section>
+
+  <script src="/public/onsite.js"></script>
+</body>
+</html>
