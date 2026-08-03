@@ -15,6 +15,11 @@
     </div>
   </header>
 
+  <section id="orderingBanner" class="ordering-banner" role="status" hidden>
+    <strong id="orderingBannerTitle"></strong>
+    <span id="orderingBannerText"></span>
+  </section>
+
   <main class="shop-layout">
     <section class="catalog-panel">
       <div class="catalog-heading">
@@ -48,6 +53,20 @@
         <strong id="cartTotal">¥0.00</strong>
       </div>
       <form id="checkoutForm" class="checkout-form">
+        <section id="onsiteAccessPanel" class="onsite-access-panel" hidden>
+          <div id="onsiteAccessPrompt">
+            <strong>现场下单验证</strong>
+            <p>请输入摊位屏幕上显示的四位下单码。</p>
+            <div class="onsite-code-entry">
+              <input id="onsiteCodeInput" type="tel" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" placeholder="四位码" autocomplete="one-time-code">
+              <button id="onsiteVerifyBtn" class="ghost-btn" type="button">验证</button>
+            </div>
+          </div>
+          <div id="onsiteAccessGranted" class="onsite-access-granted" hidden>
+            <strong>现场验证已通过</strong>
+            <span id="onsiteAccessExpiry">可以继续完成本次点单</span>
+          </div>
+        </section>
         <label>领取方式</label>
         <div class="segmented">
           <button type="button" class="active" data-receive="now">现在领取</button>
