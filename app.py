@@ -4,6 +4,7 @@ import base64
 import binascii
 import csv
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -33,10 +34,18 @@ JSON_HEADERS = {
 }
 ADMIN_COOKIE = "booth_admin"
 ADMIN_SESSION_TTL = 7 * 24 * 60 * 60
+ONSITE_ACCESS_COOKIE = "booth_onsite_access"
+ONSITE_ACCESS_TTL = 15 * 60
+ONSITE_CODE_PERIOD = 10 * 60
+ORDERING_MODES = {"preview", "direct", "onsite"}
 DB_LOCK = threading.Lock()
+ONSITE_ATTEMPTS_LOCK = threading.Lock()
+ONSITE_ATTEMPTS: dict[str, list[float]] = {}
 PRODUCT_MEDIA_PREFIX = "/api/media/products/"
 SETTING_MEDIA_PREFIX = "/api/media/settings/"
 MEDIA_SETTING_KEYS = {"logo", "wechat_qr", "alipay_qr"}
+PRIVATE_SETTING_KEYS = {"admin_password", "onsite_code_secret", "onsite_access_secret"}
+ADMIN_DISPLAY_PATH = f"{ADMIN_PATH.rstrip('/')}/display"
 
 
 def now_text() -> str:
@@ -94,6 +103,9 @@ def init_db() -> None:
                 picker_name TEXT NOT NULL DEFAULT '',
                 picker_at TEXT NOT NULL DEFAULT '',
                 ready_at TEXT NOT NULL DEFAULT '',
+                cancelled_by TEXT NOT NULL DEFAULT '',
+                cancelled_at TEXT NOT NULL DEFAULT '',
+                cancel_reason TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -131,6 +143,10 @@ def init_db() -> None:
             "admin_password": "123456",
             "staff_members": "[]",
             "promotions": '{"amount_gifts":[],"quantity_gifts":[],"bundle_discounts":[],"amount_discounts":[]}',
+            "ordering_mode": "direct",
+            "preview_opening_time": "",
+            "onsite_code_secret": secrets.token_urlsafe(32),
+            "onsite_access_secret": secrets.token_urlsafe(32),
         }
         for key, value in defaults.items():
             conn.execute(
@@ -150,6 +166,12 @@ def init_db() -> None:
             conn.execute("ALTER TABLE orders ADD COLUMN picker_at TEXT NOT NULL DEFAULT ''")
         if "discount_details" not in order_columns:
             conn.execute("ALTER TABLE orders ADD COLUMN discount_details TEXT NOT NULL DEFAULT '[]'")
+        if "cancelled_by" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN cancelled_by TEXT NOT NULL DEFAULT ''")
+        if "cancelled_at" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN cancelled_at TEXT NOT NULL DEFAULT ''")
+        if "cancel_reason" not in order_columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN cancel_reason TEXT NOT NULL DEFAULT ''")
         item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(order_items)").fetchall()}
         if "picked" not in item_columns:
             conn.execute("ALTER TABLE order_items ADD COLUMN picked INTEGER NOT NULL DEFAULT 0")
@@ -212,10 +234,17 @@ def read_body(handler: BaseHTTPRequestHandler) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
-def write_json(handler: BaseHTTPRequestHandler, status: int, payload: dict | list) -> None:
+def write_json(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    payload: dict | list,
+    extra_headers: dict[str, str] | None = None,
+) -> None:
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     for key, value in JSON_HEADERS.items():
+        handler.send_header(key, value)
+    for key, value in (extra_headers or {}).items():
         handler.send_header(key, value)
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
@@ -250,13 +279,83 @@ def setting_media_url(key: str, value: str) -> str:
 def settings_dict(conn: sqlite3.Connection, public: bool = True, media_urls: bool = False) -> dict:
     rows = conn.execute("SELECT key, value FROM settings").fetchall()
     result = {row["key"]: row["value"] for row in rows}
-    result.pop("admin_password", None)
+    for key in PRIVATE_SETTING_KEYS:
+        result.pop(key, None)
     if public:
         result.pop("staff_members", None)
     if media_urls:
         for key in MEDIA_SETTING_KEYS:
             result[key] = setting_media_url(key, result.get(key, ""))
     return result
+
+
+def setting_value(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return str(row["value"]) if row else default
+
+
+def ordering_mode(conn: sqlite3.Connection) -> str:
+    mode = setting_value(conn, "ordering_mode", "direct")
+    return mode if mode in ORDERING_MODES else "direct"
+
+
+def onsite_code_state(conn: sqlite3.Connection, now: int | None = None) -> dict:
+    current = int(time.time()) if now is None else int(now)
+    slot = current // ONSITE_CODE_PERIOD
+    secret = setting_value(conn, "onsite_code_secret")
+    digest = hmac.new(secret.encode("utf-8"), str(slot).encode("utf-8"), hashlib.sha256).digest()
+    code = f"{int.from_bytes(digest[:4], 'big') % 10000:04d}"
+    expires_at = (slot + 1) * ONSITE_CODE_PERIOD
+    return {
+        "code": code,
+        "expires_at": expires_at,
+        "seconds_remaining": max(0, expires_at - current),
+    }
+
+
+def cookie_value(handler: BaseHTTPRequestHandler, name: str) -> str:
+    jar = cookies.SimpleCookie(handler.headers.get("Cookie"))
+    value = jar.get(name)
+    return value.value if value else ""
+
+
+def onsite_access_token(secret: str, expires_at: int) -> str:
+    message = f"onsite:{expires_at}"
+    signature = hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{expires_at}.{signature}"
+
+
+def onsite_access_expiry(handler: BaseHTTPRequestHandler, conn: sqlite3.Connection) -> int:
+    token = cookie_value(handler, ONSITE_ACCESS_COOKIE)
+    try:
+        expires_text, signature = token.split(".", 1)
+        expires_at = int(expires_text)
+    except (ValueError, TypeError):
+        return 0
+    if expires_at <= int(time.time()):
+        return 0
+    secret = setting_value(conn, "onsite_access_secret")
+    expected = onsite_access_token(secret, expires_at).split(".", 1)[1]
+    return expires_at if hmac.compare_digest(signature, expected) else 0
+
+
+def onsite_attempt_key(handler: BaseHTTPRequestHandler) -> str:
+    forwarded = handler.headers.get("X-Forwarded-For", "").split(",", 1)[0].strip()
+    return forwarded or str(handler.client_address[0])
+
+
+def onsite_attempt_allowed(key: str, record_failure: bool = False) -> bool:
+    now = time.time()
+    with ONSITE_ATTEMPTS_LOCK:
+        recent = [stamp for stamp in ONSITE_ATTEMPTS.get(key, []) if now - stamp < 60]
+        allowed = len(recent) < 8
+        if record_failure and allowed:
+            recent.append(now)
+        if recent:
+            ONSITE_ATTEMPTS[key] = recent
+        else:
+            ONSITE_ATTEMPTS.pop(key, None)
+    return allowed
 
 
 def staff_members_from_settings(settings: dict) -> list[str]:
@@ -792,6 +891,8 @@ class BoothHandler(BaseHTTPRequestHandler):
             return self.serve_file("index.html")
         if path == ADMIN_PATH:
             return self.serve_file("admin.html")
+        if path == ADMIN_DISPLAY_PATH:
+            return self.serve_file("onsite.html")
         if path.startswith("/public/"):
             return self.serve_file(path.removeprefix("/public/"))
         if path.startswith(PRODUCT_MEDIA_PREFIX):
@@ -804,6 +905,20 @@ class BoothHandler(BaseHTTPRequestHandler):
         if path == "/api/products":
             with DB_LOCK, connect() as conn:
                 return write_json(self, 200, list_products(conn, admin=False))
+        if path == "/api/ordering-status":
+            with DB_LOCK, connect() as conn:
+                mode = ordering_mode(conn)
+                access_expires_at = onsite_access_expiry(self, conn)
+            return write_json(
+                self,
+                200,
+                {
+                    "mode": mode,
+                    "access_required": mode == "onsite",
+                    "access_granted": mode != "onsite" or access_expires_at > 0,
+                    "access_expires_at": access_expires_at,
+                },
+            )
         if path == "/api/admin/me":
             session = admin_session(self)
             return write_json(
@@ -832,6 +947,15 @@ class BoothHandler(BaseHTTPRequestHandler):
                 return
             with DB_LOCK, connect() as conn:
                 return write_json(self, 200, settings_dict(conn, public=False, media_urls=True))
+        if path == "/api/admin/onsite-code":
+            if not require_admin(self):
+                return
+            with DB_LOCK, connect() as conn:
+                state = onsite_code_state(conn)
+                state["mode"] = ordering_mode(conn)
+                state["booth_name"] = setting_value(conn, "booth_name", "摊位点单")
+                state["logo"] = setting_media_url("logo", setting_value(conn, "logo"))
+            return write_json(self, 200, state)
         if path == "/api/admin/sales":
             if not require_admin(self):
                 return
@@ -865,6 +989,8 @@ class BoothHandler(BaseHTTPRequestHandler):
                 return self.logout()
             if path == "/api/orders":
                 return self.create_order_v2()
+            if path == "/api/onsite/verify":
+                return self.verify_onsite_code()
             if path == "/api/admin/products":
                 if not require_admin(self):
                     return
@@ -873,6 +999,19 @@ class BoothHandler(BaseHTTPRequestHandler):
                 if not require_admin(self):
                     return
                 return self.bulk_set_products_active()
+            if path == "/api/admin/ordering-mode":
+                if not require_admin(self):
+                    return
+                return self.update_ordering_mode()
+            if path == "/api/admin/onsite-code/rotate":
+                if not require_admin(self):
+                    return
+                return self.rotate_onsite_code()
+            if path.startswith("/api/admin/orders/") and path.endswith("/cancel"):
+                if not require_admin(self):
+                    return
+                order_id = int(path.removesuffix("/cancel").rsplit("/", 1)[-1])
+                return self.cancel_order(order_id)
             if path == "/api/admin/settings":
                 if not require_admin(self):
                     return
@@ -1039,6 +1178,124 @@ class BoothHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'{"ok": true}')
 
+    def verify_onsite_code(self) -> None:
+        payload = read_body(self)
+        code = str(payload.get("code", "")).strip()
+        if not code.isdigit() or len(code) != 4:
+            return write_json(self, 400, {"error": "请输入四位现场下单码"})
+        attempt_key = onsite_attempt_key(self)
+        if not onsite_attempt_allowed(attempt_key):
+            return write_json(self, 429, {"error": "尝试次数太多，请稍后再试"})
+        now = int(time.time())
+        with DB_LOCK, connect() as conn:
+            if ordering_mode(conn) != "onsite":
+                return write_json(self, 409, {"error": "当前没有开启现场码接单"})
+            current_code = onsite_code_state(conn, now)["code"]
+            accepted_codes = {current_code}
+            if now % ONSITE_CODE_PERIOD < 60:
+                accepted_codes.add(onsite_code_state(conn, now - ONSITE_CODE_PERIOD)["code"])
+            if code not in accepted_codes:
+                onsite_attempt_allowed(attempt_key, record_failure=True)
+                return write_json(self, 403, {"error": "现场下单码不正确"})
+            access_secret = setting_value(conn, "onsite_access_secret")
+        with ONSITE_ATTEMPTS_LOCK:
+            ONSITE_ATTEMPTS.pop(attempt_key, None)
+        expires_at = now + ONSITE_ACCESS_TTL
+        token = onsite_access_token(access_secret, expires_at)
+        cookie = (
+            f"{ONSITE_ACCESS_COOKIE}={token}; Path=/; Max-Age={ONSITE_ACCESS_TTL}; "
+            f"HttpOnly; SameSite=Lax{cookie_secure_suffix(self)}"
+        )
+        write_json(
+            self,
+            200,
+            {"ok": True, "access_granted": True, "access_expires_at": expires_at},
+            {"Set-Cookie": cookie},
+        )
+
+    def update_ordering_mode(self) -> None:
+        payload = read_body(self)
+        mode = str(payload.get("mode", "")).strip()
+        if mode not in ORDERING_MODES:
+            raise ValueError("接单模式不正确")
+        with DB_LOCK, connect() as conn:
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES('ordering_mode', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (mode,),
+            )
+            conn.commit()
+        write_json(self, 200, {"ok": True, "mode": mode})
+
+    def rotate_onsite_code(self) -> None:
+        with DB_LOCK, connect() as conn:
+            conn.execute(
+                "INSERT INTO settings(key, value) VALUES('onsite_code_secret', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (secrets.token_urlsafe(32),),
+            )
+            conn.commit()
+            state = onsite_code_state(conn)
+        write_json(self, 200, {"ok": True, **state})
+
+    def cancel_order(self, order_id: int) -> None:
+        payload = read_body(self)
+        refund_confirmed = bool(payload.get("refund_confirmed"))
+        cancel_reason = str(payload.get("reason", "")).strip()[:120]
+        session = admin_session(self)
+        cancelled_by = str(session["staff_name"] or "摊主") if session else "摊主"
+        with DB_LOCK, connect() as conn:
+            order = conn.execute(
+                "SELECT order_status, payment_status FROM orders WHERE id = ?",
+                (order_id,),
+            ).fetchone()
+            if not order:
+                return write_json(self, 404, {"error": "订单不存在"})
+            if order["order_status"] == "cancelled":
+                detail = order_detail(conn, order_id)
+                return write_json(self, 200, detail)
+            if order["order_status"] == "completed":
+                return write_json(self, 409, {"error": "已取单的订单不能直接取消"})
+            if not cancel_reason:
+                return write_json(self, 400, {"error": "请填写取消原因"})
+            paid = order["payment_status"] in {"verified", "cash_received"}
+            if paid and not refund_confirmed:
+                return write_json(self, 409, {"error": "这笔订单已经核验付款，请先确认退款处理情况"})
+            quantities = conn.execute(
+                """
+                SELECT product_id, SUM(quantity) AS quantity
+                FROM order_items
+                WHERE order_id = ? AND product_id IS NOT NULL
+                GROUP BY product_id
+                """,
+                (order_id,),
+            ).fetchall()
+            stamp = now_text()
+            released_quantity = 0
+            for item in quantities:
+                quantity = max(0, int(item["quantity"] or 0))
+                if quantity <= 0:
+                    continue
+                conn.execute(
+                    "UPDATE products SET stock = stock + ?, updated_at = ? WHERE id = ?",
+                    (quantity, stamp, item["product_id"]),
+                )
+                released_quantity += quantity
+            conn.execute("UPDATE order_items SET picked = 0 WHERE order_id = ?", (order_id,))
+            conn.execute(
+                """
+                UPDATE orders
+                SET order_status = 'cancelled', picker_name = '', picker_at = '', ready_at = '',
+                    cancelled_by = ?, cancelled_at = ?, cancel_reason = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (cancelled_by, stamp, cancel_reason, stamp, order_id),
+            )
+            conn.commit()
+            detail = order_detail(conn, order_id)
+        detail["released_quantity"] = released_quantity
+        write_json(self, 200, detail)
+
     def create_order_v2(self) -> None:
         payload = read_body(self)
         client_token = str(payload.get("client_token", "")).strip()[:80]
@@ -1075,6 +1332,11 @@ class BoothHandler(BaseHTTPRequestHandler):
                 ).fetchone()
                 if existing:
                     return write_json(self, 200, order_detail(conn, existing["id"]))
+            mode = ordering_mode(conn)
+            if mode == "preview":
+                return write_json(self, 403, {"error": "当前仅供浏览，暂未开放下单"})
+            if mode == "onsite" and not onsite_access_expiry(self, conn):
+                return write_json(self, 403, {"error": "请先输入现场下单码"})
             requested: dict[int, int] = {}
             for item in items:
                 product_id = int(item.get("product_id"))
@@ -1448,7 +1710,7 @@ class BoothHandler(BaseHTTPRequestHandler):
 
     def update_order(self, order_id: int) -> None:
         payload = read_body(self)
-        allowed_status = {"new", "picking", "ready", "completed", "cancelled"}
+        allowed_status = {"new", "picking", "ready", "completed"}
         allowed_payment = {"pending", "verified", "cash_pending", "cash_received"}
         requested_picker = None
         if "picker_name" in payload:
@@ -1525,7 +1787,10 @@ class BoothHandler(BaseHTTPRequestHandler):
 
     def update_settings(self) -> None:
         payload = read_body(self)
-        allowed = {"booth_name", "welcome", "logo", "wechat_qr", "alipay_qr", "admin_password", "staff_members", "promotions"}
+        allowed = {
+            "booth_name", "welcome", "logo", "wechat_qr", "alipay_qr", "admin_password",
+            "staff_members", "promotions", "preview_opening_time",
+        }
         with DB_LOCK, connect() as conn:
             for key, value in payload.items():
                 if key in allowed:
@@ -1550,7 +1815,8 @@ class BoothHandler(BaseHTTPRequestHandler):
                 """
                 SELECT
                     o.pickup_code, o.created_at, o.order_status, o.payment_method, o.payment_status,
-                    o.receive_type, o.phone, o.phone_tail, o.pickup_time, oi.name, oi.item_type, oi.promotion_name, oi.price, oi.quantity,
+                    o.cancelled_by, o.cancelled_at, o.cancel_reason, o.receive_type, o.phone, o.phone_tail, o.pickup_time,
+                    oi.name, oi.item_type, oi.promotion_name, oi.price, oi.quantity,
                     ROUND(oi.price * oi.quantity, 2) AS line_total,
                     oi.author, oi.category, oi.tags, o.total
                 FROM orders o
@@ -1564,8 +1830,9 @@ class BoothHandler(BaseHTTPRequestHandler):
             "商品名", "单价", "数量", "小计", "作者", "分类", "标签", "订单总价",
         ]
         header = [
-            "取单码", "下单时间", "订单状态", "支付方式", "支付状态", "领取方式", "电话", "尾号", "预计领取时间",
-            "商品名", "类型", "促销规则", "单价", "数量", "小计", "作者", "分类", "标签", "订单总价",
+            "取单码", "下单时间", "订单状态", "支付方式", "支付状态", "取消摊员", "取消时间", "取消原因",
+            "领取方式", "电话", "尾号", "预计领取时间", "商品名", "类型", "促销规则", "单价", "数量",
+            "小计", "作者", "分类", "标签", "订单总价",
         ]
         output.append(header)
         for row in rows:
