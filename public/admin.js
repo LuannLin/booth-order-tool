@@ -430,7 +430,7 @@ function mountAdminView() {
             <div class="lane"><h2>新订单<span id="countNew">0</span></h2><div id="laneNew"></div></div>
             <div class="lane"><h2>拣货中<span id="countPicking">0</span></h2><div id="lanePicking"></div></div>
             <div class="lane"><h2>待取单<span id="countReady">0</span></h2><div id="laneReady"></div></div>
-            <div class="lane"><h2>已完成<span id="countDone">0</span></h2><div id="laneDone"></div></div>
+            <div class="lane"><h2>已完成 / 已取消<span id="countDone">0</span></h2><div id="laneDone"></div></div>
           </div>
         </section>
 
@@ -500,6 +500,35 @@ function mountAdminView() {
               <h2>展示与收款</h2>
             </div>
           </div>
+          <section class="ordering-manager">
+            <div class="ordering-manager-heading">
+              <div>
+                <span class="section-kicker">买家入口</span>
+                <h2>接单状态</h2>
+                <p id="orderingModeDescription" class="small-muted"></p>
+              </div>
+              <span id="orderingModeBadge" class="ordering-mode-badge"></span>
+            </div>
+            <div id="orderingModeControls" class="ordering-mode-controls">
+              <button class="ghost-btn" type="button" data-ordering-mode="preview">仅供浏览</button>
+              <button class="ghost-btn" type="button" data-ordering-mode="direct">直接接单</button>
+              <button class="ghost-btn" type="button" data-ordering-mode="onsite">现场码接单</button>
+            </div>
+            <div class="preview-opening-control">
+              <label>预计开摊时间
+                <input id="previewOpeningTime" type="datetime-local">
+              </label>
+              <div>
+                <button id="savePreviewOpeningTime" class="ghost-btn" type="button">保存时间</button>
+                <button id="clearPreviewOpeningTime" class="ghost-btn" type="button">清除</button>
+              </div>
+              <p class="small-muted">仅供浏览时展示给买家；到时间后仍由摊员手动开放接单。</p>
+            </div>
+            <div class="ordering-display-actions">
+              <button id="openOnsiteDisplay" class="primary-btn" type="button">打开现场码屏</button>
+              <button id="rotateOnsiteCode" class="ghost-btn" type="button">立即更换现场码</button>
+            </div>
+          </section>
           <form id="settingsForm" class="editor-form settings-form">
             <label>摊位名<input id="settingBoothName"></label>
             <label>欢迎语<textarea id="settingWelcome" rows="3"></textarea></label>
@@ -679,6 +708,9 @@ function orderActionButtons(order) {
   if (order.order_status === "completed") {
     actions.push(`<button class="ghost-btn" data-order-status="${order.id}:ready">撤回待取单</button>`);
   }
+  if (!["completed", "cancelled"].includes(order.order_status)) {
+    actions.push(`<button class="ghost-btn danger-text" data-cancel-order="${order.id}">取消并释放库存</button>`);
+  }
   return actions.join("");
 }
 
@@ -714,6 +746,16 @@ function pickerMeta(order) {
   return "";
 }
 
+function cancellationMeta(order) {
+  if (order.order_status !== "cancelled") return "";
+  const staff = escapeHtml(order.cancelled_by || "未记录摊员");
+  const time = order.cancelled_at ? ` · ${escapeHtml(order.cancelled_at)}` : "";
+  const reason = order.cancel_reason
+    ? `<span>原因：${escapeHtml(order.cancel_reason)}</span>`
+    : `<span>原因：未记录</span>`;
+  return `<p class="order-meta cancellation-meta"><span>取消操作：${staff}${time}</span>${reason}</p>`;
+}
+
 function renderOrders() {
   const lanes = {
     new: document.querySelector("#laneNew"),
@@ -735,7 +777,7 @@ function renderOrders() {
     const payBadgeClass = ["verified", "cash_received"].includes(order.payment_status) ? "ok" : "warn";
     const contact = order.receive_type === "later" ? `电话 ${order.phone || "未填"}` : `尾号 ${order.phone_tail || "未填"}`;
     const card = document.createElement("article");
-    card.className = `order-card ${order.id > adminState.lastOrderId ? "new-flash" : ""}`;
+    card.className = `order-card ${order.order_status === "cancelled" ? "cancelled" : ""} ${order.id > adminState.lastOrderId ? "new-flash" : ""}`;
     card.innerHTML = `
       <div class="order-code-row">
         <div>
@@ -743,11 +785,13 @@ function renderOrders() {
           <div class="order-meta">${escapeHtml(order.created_at)}</div>
         </div>
         <div>
+          ${order.order_status === "cancelled" ? `<span class="badge cancelled-badge">已取消</span>` : ""}
           <span class="badge ${payBadgeClass}">${payText[order.payment_status]}</span>
         </div>
       </div>
       <p class="order-meta">${receiveText[order.receive_type]} · ${methodText[order.payment_method]} · ${escapeHtml(contact)}</p>
       ${pickerMeta(order)}
+      ${cancellationMeta(order)}
       ${order.pickup_time ? `<p class="order-meta">预计领取：${escapeHtml(order.pickup_time)}</p>` : ""}
       ${orderItemsMarkup(order, true)}
       ${priceSummaryMarkup(order, true)}
@@ -815,7 +859,7 @@ function salesOrderCard(order) {
     ? `电话 ${escapeHtml(order.phone || "未填")}`
     : `尾号 ${escapeHtml(order.phone_tail || "未填")}`;
   return `
-    <article class="sales-order-card">
+    <article class="sales-order-card ${order.order_status === "cancelled" ? "cancelled" : ""}">
       <div class="order-code-row">
         <div>
           <div class="order-code">${escapeHtml(order.pickup_code)}</div>
@@ -831,6 +875,10 @@ function salesOrderCard(order) {
         <span>${receiveText[order.receive_type]} · ${methodText[order.payment_method]}</span>
         <span>${contact}</span>
         ${order.pickup_time ? `<span>预计领取 ${escapeHtml(order.pickup_time)}</span>` : ""}
+        ${order.order_status === "cancelled" ? `
+          <span class="cancellation-meta">取消：${escapeHtml(order.cancelled_by || "未记录摊员")}${order.cancelled_at ? ` · ${escapeHtml(order.cancelled_at)}` : ""}</span>
+          <span class="cancellation-meta">原因：${escapeHtml(order.cancel_reason || "未记录")}</span>
+        ` : ""}
       </div>
       <ol class="sales-order-items">${order.items.map((item) => `<li>${orderItemLine(item)}</li>`).join("")}</ol>
     </article>
@@ -1240,13 +1288,69 @@ function renderSettings(force = false) {
   if (adminState.settingsDirty && !force) return;
   document.querySelector("#settingBoothName").value = adminState.settings.booth_name || "";
   document.querySelector("#settingWelcome").value = adminState.settings.welcome || "";
+  const previewOpeningTime = document.querySelector("#previewOpeningTime");
+  if (previewOpeningTime) previewOpeningTime.value = adminState.settings.preview_opening_time || "";
   adminState.settingImages = {
     logo: adminState.settings.logo || "",
     wechat_qr: adminState.settings.wechat_qr || "",
     alipay_qr: adminState.settings.alipay_qr || "",
   };
   renderStaffManager();
+  renderOrderingManager();
   if (!adminState.promotionsDirty || force) renderPromotions();
+}
+
+function renderOrderingManager() {
+  const mode = adminState.settings.ordering_mode || "direct";
+  const definitions = {
+    preview: ["仅供浏览", adminState.settings.preview_opening_time
+      ? `买家可以查看制品，并会看到预计开摊时间 ${adminState.settings.preview_opening_time.replace("T", " ")}。`
+      : "买家可以查看制品，但不能加入购物车或提交订单。"],
+    direct: ["直接接单", "买家扫描静态二维码后可以直接点单。"],
+    onsite: ["现场码接单", "买家需要输入现场码屏上的四位码，验证后才能提交订单。"],
+  };
+  const [label, description] = definitions[mode] || definitions.direct;
+  const badge = document.querySelector("#orderingModeBadge");
+  const descriptionBox = document.querySelector("#orderingModeDescription");
+  if (!badge || !descriptionBox) return;
+  badge.textContent = label;
+  badge.dataset.mode = mode;
+  descriptionBox.textContent = description;
+  document.querySelectorAll("[data-ordering-mode]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.orderingMode === mode);
+  });
+  document.querySelector("#openOnsiteDisplay").disabled = mode !== "onsite";
+  document.querySelector("#rotateOnsiteCode").disabled = mode !== "onsite";
+}
+
+async function savePreviewOpeningTime(clear = false) {
+  const input = document.querySelector("#previewOpeningTime");
+  const value = clear ? "" : input.value;
+  await api("/api/admin/settings", {
+    method: "POST",
+    body: JSON.stringify({ preview_opening_time: value }),
+  });
+  adminState.settings.preview_opening_time = value;
+  input.value = value;
+  renderOrderingManager();
+  showAdminToast(value ? "预计开摊时间已保存" : "预计开摊时间已清除");
+}
+
+async function setOrderingMode(mode) {
+  await api("/api/admin/ordering-mode", {
+    method: "POST",
+    body: JSON.stringify({ mode }),
+  });
+  adminState.settings.ordering_mode = mode;
+  renderOrderingManager();
+  const labels = { preview: "已切换为仅供浏览", direct: "已开放直接下单", onsite: "已开启现场码接单" };
+  showAdminToast(labels[mode] || "接单状态已更新");
+}
+
+async function rotateOnsiteCode() {
+  if (!confirm("立即更换现场码吗？已经验证成功的买家不会受到影响。")) return;
+  await api("/api/admin/onsite-code/rotate", { method: "POST", body: "{}" });
+  showAdminToast("现场码已更换");
 }
 
 function applyLoadedOrders(orders, playNotice) {
@@ -1509,6 +1613,26 @@ async function releaseOrder(id) {
   await loadOrders(false);
 }
 
+async function cancelOrder(id) {
+  const order = adminState.orders.find((item) => item.id === Number(id));
+  if (!order) return;
+  const reasonInput = prompt("请输入取消原因，例如：顾客取消、重复下单、选错制品或缺货。");
+  if (reasonInput === null) return;
+  const reason = reasonInput.trim().slice(0, 120);
+  if (!reason) return alert("请填写取消原因");
+  const paid = ["verified", "cash_received"].includes(order.payment_status);
+  const message = paid
+    ? "这笔订单已经核验付款。请先确认退款或差额已经处理，再取消并释放库存。"
+    : "确定取消这笔订单并把普通商品和赠品库存全部退回吗？";
+  if (!confirm(message)) return;
+  const result = await api(`/api/admin/orders/${id}/cancel`, {
+    method: "POST",
+    body: JSON.stringify({ refund_confirmed: paid, reason }),
+  });
+  showAdminToast(`订单已取消，已释放 ${Number(result.released_quantity || 0)} 件库存`);
+  await loadAll(false);
+}
+
 async function togglePicked(itemId, picked) {
   await api(`/api/admin/order-items/${itemId}`, {
     method: "PATCH",
@@ -1653,6 +1777,7 @@ document.addEventListener("click", async (event) => {
   const claim = event.target.closest("[data-claim-order]");
   const transfer = event.target.closest("[data-transfer-order]");
   const release = event.target.closest("[data-release-order]");
+  const cancel = event.target.closest("[data-cancel-order]");
   const pickItem = event.target.closest("[data-pick-item]");
   const copyProduct = event.target.closest("[data-copy-product]");
   const edit = event.target.closest("[data-edit-product]");
@@ -1663,11 +1788,22 @@ document.addEventListener("click", async (event) => {
   const removePromo = event.target.closest("[data-remove-promo]");
   const savePromo = event.target.closest("#savePromotions");
   const addTag = event.target.closest("[data-add-tag]");
+  const orderingMode = event.target.closest("[data-ordering-mode]");
+  const openDisplay = event.target.closest("#openOnsiteDisplay");
+  const rotateCode = event.target.closest("#rotateOnsiteCode");
+  const saveOpeningTime = event.target.closest("#savePreviewOpeningTime");
+  const clearOpeningTime = event.target.closest("#clearPreviewOpeningTime");
   try {
     if (addTag) addTagToForm(addTag.dataset.addTag);
     if (claim) await claimOrder(claim.dataset.claimOrder);
     if (transfer) await transferOrder(transfer.dataset.transferOrder);
     if (release) await releaseOrder(release.dataset.releaseOrder);
+    if (cancel) await cancelOrder(cancel.dataset.cancelOrder);
+    if (orderingMode) await setOrderingMode(orderingMode.dataset.orderingMode);
+    if (openDisplay) window.open(`${window.location.pathname.replace(/\/$/, "")}/display`, "_blank", "noopener");
+    if (rotateCode) await rotateOnsiteCode();
+    if (saveOpeningTime) await savePreviewOpeningTime(false);
+    if (clearOpeningTime) await savePreviewOpeningTime(true);
     if (pickItem) {
       const nextPicked = pickItem.dataset.picked !== "1";
       await togglePicked(pickItem.dataset.pickItem, nextPicked);
