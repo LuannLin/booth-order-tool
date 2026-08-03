@@ -7,10 +7,27 @@ const state = {
   toastTimer: null,
   pendingOrderToken: "",
   submitting: false,
+  orderingMode: "direct",
+  onsiteAccessGranted: true,
+  onsiteAccessExpiresAt: 0,
 };
 
 const money = (value) => `¥${Number(value || 0).toFixed(2)}`;
 const digitsOnly = (value) => value.replace(/\D/g, "");
+const unixNow = () => Math.floor(Date.now() / 1000);
+
+function hasCurrentOnsiteAccess(ordering) {
+  const expiresAt = Number(ordering.access_expires_at || 0);
+  return Boolean(ordering.access_granted) && expiresAt > unixNow();
+}
+
+function previewOpeningText(value) {
+  const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+  if (!match) return "现在可以查看制品，现场开售后才能加入购物车和下单。";
+  const [, year, month, day, hour, minute] = match;
+  const yearText = Number(year) === new Date().getFullYear() ? "" : `${Number(year)}年`;
+  return `预计 ${yearText}${Number(month)}月${Number(day)}日 ${hour}:${minute} 开始接单，请到时刷新页面。`;
+}
 
 function escapeHtml(value) {
   return String(value ?? "").replace(/[&<>"']/g, (char) => ({
@@ -84,6 +101,90 @@ function renderBooth() {
   if (state.settings.logo) {
     logo.src = state.settings.logo;
     logo.hidden = false;
+  }
+}
+
+function renderOrderingState() {
+  const banner = document.querySelector("#orderingBanner");
+  const title = document.querySelector("#orderingBannerTitle");
+  const text = document.querySelector("#orderingBannerText");
+  const accessPanel = document.querySelector("#onsiteAccessPanel");
+  const prompt = document.querySelector("#onsiteAccessPrompt");
+  const granted = document.querySelector("#onsiteAccessGranted");
+  if (state.orderingMode === "onsite" && state.onsiteAccessGranted && state.onsiteAccessExpiresAt <= unixNow()) {
+    state.onsiteAccessGranted = false;
+    state.onsiteAccessExpiresAt = 0;
+  }
+  const isPreview = state.orderingMode === "preview";
+  const needsAccess = state.orderingMode === "onsite" && !state.onsiteAccessGranted;
+
+  banner.className = `ordering-banner ${isPreview ? "preview" : "onsite"}`;
+  banner.hidden = state.orderingMode === "direct";
+  if (isPreview) {
+    title.textContent = "制品预览中";
+    text.textContent = previewOpeningText(state.settings.preview_opening_time);
+  } else if (state.orderingMode === "onsite") {
+    title.textContent = state.onsiteAccessGranted ? "现场验证已通过" : "现场下单已开放";
+    text.textContent = state.onsiteAccessGranted
+      ? "请在验证有效期内提交订单。"
+      : "选好制品后，请在结算区输入摊位屏幕上的四位下单码。";
+  }
+
+  accessPanel.hidden = state.orderingMode !== "onsite";
+  prompt.hidden = !needsAccess;
+  granted.hidden = needsAccess;
+  if (!needsAccess && state.orderingMode === "onsite") updateOnsiteAccessCountdown();
+  document.body.classList.toggle("preview-mode", isPreview);
+}
+
+function updateOnsiteAccessCountdown() {
+  if (state.orderingMode !== "onsite" || !state.onsiteAccessGranted) return;
+  const remaining = Math.max(0, state.onsiteAccessExpiresAt - unixNow());
+  if (remaining <= 0) {
+    state.onsiteAccessGranted = false;
+    state.onsiteAccessExpiresAt = 0;
+    renderOrderingState();
+    renderProducts();
+    renderCart();
+    showToast("现场验证已过期，请重新输入现场码");
+    return;
+  }
+  const minutes = String(Math.floor(remaining / 60)).padStart(2, "0");
+  const seconds = String(remaining % 60).padStart(2, "0");
+  const expiry = document.querySelector("#onsiteAccessExpiry");
+  if (expiry) expiry.textContent = `本次验证剩余 ${minutes}:${seconds}`;
+}
+
+async function verifyOnsiteCode() {
+  const input = document.querySelector("#onsiteCodeInput");
+  const button = document.querySelector("#onsiteVerifyBtn");
+  const code = digitsOnly(input.value).slice(0, 4);
+  input.value = code;
+  if (code.length !== 4) {
+    showToast("请输入四位现场下单码");
+    input.focus();
+    return;
+  }
+  button.disabled = true;
+  button.textContent = "验证中";
+  try {
+    const result = await api("/api/onsite/verify", {
+      method: "POST",
+      body: JSON.stringify({ code }),
+    });
+    state.onsiteAccessExpiresAt = Number(result.access_expires_at || 0);
+    state.onsiteAccessGranted = hasCurrentOnsiteAccess(result);
+    input.value = "";
+    renderOrderingState();
+    renderCart();
+    renderProducts();
+    showToast("现场验证已通过");
+  } catch (error) {
+    showToast(error.message);
+    input.select();
+  } finally {
+    button.disabled = false;
+    button.textContent = "验证";
   }
 }
 
@@ -255,7 +356,7 @@ function renderProducts() {
   grid.innerHTML = products.map((product) => {
     const soldOut = product.stock <= 0;
     const inCart = selectedQuantity(product.id);
-    const canAdd = availableStock(product) > 0;
+    const canAdd = state.orderingMode !== "preview" && availableStock(product) > 0;
     const tags = [product.category, product.author, product.tags].filter(Boolean).join(" · ");
     return `
       <article class="product-card ${soldOut ? "sold-out" : ""}">
@@ -274,7 +375,7 @@ function renderProducts() {
             <span class="price">${money(product.price)}</span>
             <span class="stock-text ${availableStock(product) <= (product.low_stock_threshold ?? 3) ? "low" : ""}">${stockText(product)}</span>
           </div>
-          <button class="primary-btn add-btn" data-add="${product.id}" type="button" title="${canAdd ? "加入购物车" : stockText(product)}" aria-label="${canAdd ? `加入购物车：${escapeHtml(product.name)}` : stockText(product)}" ${canAdd ? "" : "disabled"}>${soldOut ? "售罄" : canAdd ? "+" : "选完"}</button>
+           <button class="primary-btn add-btn" data-add="${product.id}" type="button" title="${canAdd ? "加入购物车" : state.orderingMode === "preview" ? "暂未开放下单" : stockText(product)}" aria-label="${canAdd ? `加入购物车：${escapeHtml(product.name)}` : state.orderingMode === "preview" ? "暂未开放下单" : stockText(product)}" ${canAdd ? "" : "disabled"}>${soldOut ? "售罄" : state.orderingMode === "preview" ? "预览" : canAdd ? "+" : "选完"}</button>
         </div>
       </article>
     `;
@@ -298,7 +399,7 @@ function renderCart() {
         <div class="qty-controls">
           <button class="icon-btn" data-minus="${product.id}" type="button">-</button>
           <span>${quantity}</span>
-          <button class="icon-btn" data-plus="${product.id}" type="button" ${quantity >= product.stock ? "disabled" : ""}>+</button>
+          <button class="icon-btn" data-plus="${product.id}" type="button" ${state.orderingMode === "preview" || quantity >= product.stock ? "disabled" : ""}>+</button>
         </div>
       </div>
     `).join("");
@@ -340,7 +441,9 @@ function renderCart() {
     document.querySelector("#shortcutCount").textContent = count;
     document.querySelector("#shortcutTotal").textContent = money(quote.total);
   }
-  document.querySelector("#submitOrder").disabled = lines.length === 0;
+  document.querySelector("#submitOrder").disabled = lines.length === 0
+    || state.orderingMode === "preview"
+    || (state.orderingMode === "onsite" && !state.onsiteAccessGranted);
 }
 
 function showToast(message) {
@@ -374,6 +477,10 @@ function setupPickupTimes() {
 }
 
 function addToCart(productId, button) {
+  if (state.orderingMode === "preview") {
+    showToast("现在仅供浏览，暂未开放下单");
+    return;
+  }
   const product = state.products.find((item) => item.id === productId);
   if (!product || product.stock <= 0) return;
   const existing = state.cart.get(productId) || { product, quantity: 0 };
@@ -391,6 +498,7 @@ function addToCart(productId, button) {
 }
 
 function changeQuantity(productId, delta) {
+  if (delta > 0 && state.orderingMode === "preview") return;
   const line = state.cart.get(productId);
   if (!line) return;
   line.quantity += delta;
@@ -491,6 +599,15 @@ function renderOrder(order) {
 async function submitOrder(event) {
   event.preventDefault();
   if (state.submitting) return;
+  if (state.orderingMode === "preview") {
+    alert("当前仅供浏览，暂未开放下单");
+    return;
+  }
+  if (state.orderingMode === "onsite" && !state.onsiteAccessGranted) {
+    alert("请先输入摊位屏幕上的四位现场下单码");
+    document.querySelector("#onsiteCodeInput").focus();
+    return;
+  }
   const phone = digitsOnly(document.querySelector("#phoneInput").value);
   const phoneTail = digitsOnly(document.querySelector("#phoneTailInput").value);
   if (state.receiveType === "later" && phone.length !== 11) {
@@ -535,24 +652,59 @@ async function submitOrder(event) {
     renderOrder(order);
     load().catch(() => showToast("订单已生成，商品库存稍后刷新"));
   } catch (error) {
+    if (error.message.includes("现场下单码")) {
+      state.onsiteAccessGranted = false;
+      renderOrderingState();
+      renderCart();
+    }
     alert(error.message);
   } finally {
     state.submitting = false;
     submitButton.textContent = "结算并生成取单码";
-    submitButton.disabled = state.cart.size === 0;
+    renderCart();
   }
 }
 
 async function load() {
-  const settings = await api("/api/settings");
-  const products = await api("/api/products");
+  const [settings, products, ordering] = await Promise.all([
+    api("/api/settings"),
+    api("/api/products"),
+    api("/api/ordering-status"),
+  ]);
   state.settings = settings;
   state.products = products;
+  state.orderingMode = ordering.mode || "direct";
+  state.onsiteAccessExpiresAt = Number(ordering.access_expires_at || 0);
+  state.onsiteAccessGranted = state.orderingMode !== "onsite" || hasCurrentOnsiteAccess(ordering);
   renderBooth();
+  renderOrderingState();
   renderFilters();
   renderBundlePromotions();
   renderProducts();
   renderCart();
+}
+
+async function refreshOrderingStatus() {
+  if (document.hidden) return;
+  try {
+    const ordering = await api("/api/ordering-status");
+    const nextMode = ordering.mode || "direct";
+    const nextExpiry = Number(ordering.access_expires_at || 0);
+    const nextAccess = nextMode !== "onsite" || hasCurrentOnsiteAccess(ordering);
+    const changed = nextMode !== state.orderingMode
+      || nextAccess !== state.onsiteAccessGranted
+      || nextExpiry !== state.onsiteAccessExpiresAt;
+    state.orderingMode = nextMode;
+    state.onsiteAccessGranted = nextAccess;
+    state.onsiteAccessExpiresAt = nextExpiry;
+    if (changed) {
+      renderOrderingState();
+      renderProducts();
+      renderCart();
+    }
+  } catch (error) {
+    // Keep the current page usable during a brief network interruption.
+  }
 }
 
 document.addEventListener("click", (event) => {
@@ -587,6 +739,16 @@ document.querySelector("#searchInput").addEventListener("input", renderProducts)
 document.querySelector("#categoryFilter").addEventListener("change", renderProducts);
 document.querySelector("#authorFilter").addEventListener("change", renderProducts);
 document.querySelector("#checkoutForm").addEventListener("submit", submitOrder);
+document.querySelector("#onsiteVerifyBtn").addEventListener("click", verifyOnsiteCode);
+document.querySelector("#onsiteCodeInput").addEventListener("input", (event) => {
+  event.target.value = digitsOnly(event.target.value).slice(0, 4);
+});
+document.querySelector("#onsiteCodeInput").addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    verifyOnsiteCode();
+  }
+});
 document.querySelector("#closeDialog").addEventListener("click", () => document.querySelector("#orderDialog").close());
 document.querySelector("#phoneInput").addEventListener("input", (event) => {
   event.target.value = digitsOnly(event.target.value).slice(0, 11);
@@ -611,3 +773,5 @@ if ("IntersectionObserver" in window) {
 
 setupPickupTimes();
 load().catch((error) => alert(error.message || "页面加载失败，请刷新后重试"));
+setInterval(refreshOrderingStatus, 5000);
+setInterval(updateOnsiteAccessCountdown, 1000);
