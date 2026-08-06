@@ -145,6 +145,8 @@ https://你的网站地址/my-booth-workroom-2026
 
 正式办展时，建议部署到支持 Python 或 Docker 的云平台/服务器，并开启 HTTPS。部署后，把买家首页网址生成二维码贴在摊位上即可。
 
+> **使用 Render 时请特别注意：** 正式保存商品、密码和订单需要付费 Web Service、Persistent Disk，以及与磁盘挂载路径一致的 `BOOTH_DATA_DIR`。Free 实例或未挂载持久磁盘的服务会在休眠、重启或重新部署后丢失本地 SQLite 数据。请在录入正式商品前按照部署说明完成重启自检。
+
 详细步骤见：
 
 ```text
